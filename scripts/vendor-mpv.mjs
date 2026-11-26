@@ -144,6 +144,12 @@ function verify() {
 }
 
 async function main() {
+  // 本地已有可用 mpv 时完全跳过网络：打包不该因为 GitHub 限流或离线而失败。
+  // （曾因 releases API 返回 403 导致 `npm run pack` 整个中断，而 vendor/mpv 其实完好。）
+  if (!FORCE && existsSync(join(TARGET, 'mpv.exe'))) {
+    console.log('[mpv] vendor/mpv 已就绪，跳过下载（--force 可强制更新）');
+    return verify();
+  }
   const sevenZip = find7za();
   console.log(`[mpv] 7za: ${sevenZip}`);
   const asset = await pickAsset();
