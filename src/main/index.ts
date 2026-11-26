@@ -1,6 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from 'electron';
 import { join, dirname } from 'node:path';
 import { mkdirSync } from 'node:fs';
+import { initLogger, log } from './logger';
 import { IPC, type Rpc } from '../shared/ipc-contract';
 import type {
   AppSettings,
@@ -271,10 +272,17 @@ function createWindow(): void {
     },
   });
 
-  win.once('ready-to-show', () => win?.show());
+  win.once('ready-to-show', () => {
+    win?.show();
+    log('[window] ready-to-show');
+  });
+  win.on('closed', () => {
+    log('[window] closed');
+    win = null;
+  });
 
   // 渲染层错误默认只留在 DevTools 里，打包后等于不可见；接到主进程日志才能诊断白屏
-  win.webContents.on('did-finish-load', () => console.log('[renderer] 页面加载完成'));
+  win.webContents.on('did-finish-load', () => log('[renderer] 页面加载完成'));
   win.webContents.on('did-fail-load', (_e, code, desc, url) => {
     console.error(`[renderer] 加载失败 code=${code} ${desc} url=${url}`);
   });
@@ -288,7 +296,7 @@ function createWindow(): void {
     console.log(`[renderer] ${args.slice(1).map(String).join(' ')}`);
   });
   win.webContents.on('render-process-gone', (_e, details) => {
-    console.error('[renderer] 渲染进程退出', details.reason, details.exitCode);
+    log('[crash] render-process-gone', details.reason, details.exitCode);
   });
   win.webContents.on('preload-error', (_e, path, err) => {
     console.error(`[preload] 加载失败 ${path}: ${err.message}`);
@@ -480,13 +488,22 @@ async function bootstrap(): Promise<void> {
 
   const located = await locateMpv(settings.mpvPath);
   mpvPath = located.path;
-  console.log(`[nebula] mpv: ${located.message}`);
+  log('[nebula] mpv:', located.message);
 
   registerIpc();
   createWindow();
+  log('[nebula] bootstrap 完成');
+}
+
+try {
+  const logPath = initLogger(join(app.getPath('userData'), 'logs'));
+  log('[boot] 启动', { electron: process.versions.electron, node: process.versions.node, logPath });
+} catch (err) {
+  console.error('[boot] 日志初始化失败', err);
 }
 
 if (!app.requestSingleInstanceLock()) {
+  log('[boot] 未获取单实例锁（已有实例在运行），退出');
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -499,7 +516,7 @@ if (!app.requestSingleInstanceLock()) {
   Menu.setApplicationMenu(null);
 
   void app.whenReady().then(bootstrap).catch((err) => {
-    console.error('[nebula] 启动失败', err);
+    log('[nebula] 启动失败', err);
     dialog.showErrorBox('启动失败', err instanceof Error ? err.message : String(err));
     app.quit();
   });
@@ -510,8 +527,26 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 app.on('window-all-closed', () => {
+  log('[app] window-all-closed → 退出');
   controller?.dispose();
   if (process.platform !== 'darwin') app.quit();
+});
+
+// 关键诊断：GPU / 渲染 / utility 子进程崩溃会让窗口消失，进而连带整个应用退出
+app.on('child-process-gone', (_event, details) => {
+  log('[crash] child-process-gone', {
+    type: details.type,
+    reason: details.reason,
+    exitCode: details.exitCode,
+    serviceName: (details as { serviceName?: string }).serviceName ?? null,
+  });
+});
+
+process.on('uncaughtException', (err) => {
+  log('[crash] uncaughtException', err);
+});
+process.on('unhandledRejection', (reason) => {
+  log('[crash] unhandledRejection', reason);
 });
 
 app.on('before-quit', () => {

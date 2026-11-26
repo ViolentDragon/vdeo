@@ -13,7 +13,54 @@
     "build": "npm run build:main && npm run build:renderer",
     "start": "npm run build && electron .",
     "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
-    "test": "node --test --import tsx test/*.test.ts"
+    "test": "node --test --import tsx test/*.test.ts",
+    "icon": "python scripts/make-icon.py",
+    "pack:dir": "npm run build && electron-builder --win --x64 --dir",
+    "pack": "npm run build && electron-builder --win --x64"
+  },
+  "build": {
+    "appId": "com.nebula.mediaplayer",
+    "productName": "Nebula",
+    "copyright": "Copyright © 2026 Nebula",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "!dist/**/*.map",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "icon": "build/icon.ico",
+      "requestedExecutionLevel": "asInvoker",
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "星云影库",
+      "deleteAppDataOnUninstall": false,
+      "installerLanguages": ["zh_CN"],
+      "language": "2052"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-portable.${ext}"
+    }
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
@@ -21,6 +68,7 @@
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^45.5.0",
+    "electron-builder": "^26.18.0",
     "esbuild": "^0.24.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
