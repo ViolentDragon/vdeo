@@ -295,6 +295,16 @@ export async function getDriveInfo(accessToken: string): Promise<DriveInfo> {
   // 诊断：只记键名不记值。用来确认 v2/user/get 到底提供了哪几个 drive id，
   // 以及资源库字段的真实名字（不同版本叫 resource_drive_id / resourceDriveId 等）。
   log('[aliyun] v2/user/get 顶层键:', Object.keys(json).join(',') || '(空)');
+  // path_status / default_location 指示资源库是否启用与默认位置——根目录返回 0 项时，
+  // 这两项是判断「盘为空」还是「盘未启用」的关键。它们不含隐私数据，直接记值。
+  log(
+    '[aliyun] 账号状态: path_status =',
+    String(json['path_status'] ?? '(无)'),
+    '| default_location =',
+    String(json['default_location'] ?? '(无)'),
+    '| role =',
+    String(json['role'] ?? '(无)'),
+  );
 
   const driveId =
     (typeof json['default_drive_id'] === 'string' && json['default_drive_id']) ||
