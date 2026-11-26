@@ -84,6 +84,7 @@ export default function App() {
   const [scan, setScan] = useState<ScanProgress | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [addKind, setAddKind] = useState<SourceKind | null>(null);
+  const [browseSourceId, setBrowseSourceId] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -406,6 +407,7 @@ export default function App() {
               }
             }}
             onScan={(id) => void startScan(id)}
+            onBrowse={(id) => setBrowseSourceId(id)}
           />
         ) : nav === 'continue' ? (
           <section className="grid">
@@ -585,6 +587,10 @@ export default function App() {
         </div>
       ) : null}
 
+      {browseSourceId ? (
+        <BrowseDialog sourceId={browseSourceId} onClose={() => setBrowseSourceId(null)} />
+      ) : null}
+
       {addKind ? (
         <AddSourceDialog
           initialKind={addKind}
@@ -672,12 +678,14 @@ function SourcesPanel({
   onRemove,
   onTest,
   onScan,
+  onBrowse,
 }: {
   sources: StorageSource[];
   onAdd: () => void;
   onRemove: (id: string) => Promise<void>;
   onTest: (id: string) => Promise<void>;
   onScan: (id: string) => void;
+  onBrowse: (id: string) => void;
 }) {
   return (
     <section className="panel">
@@ -717,6 +725,9 @@ function SourcesPanel({
                 </button>
                 <button className="btn btn--primary btn--sm" onClick={() => onScan(s.id)}>
                   扫描
+                </button>
+                <button className="btn btn--ghost btn--sm" onClick={() => onBrowse(s.id)}>
+                  浏览
                 </button>
                 <button
                   className="btn btn--danger btn--sm"
@@ -1080,6 +1091,126 @@ function SettingsPanel({
 }
 
 const SOURCE_TABS: SourceKind[] = ['local', 'webdav', 'aliyun'];
+
+interface BrowseEntry {
+  path: string;
+  name: string;
+  isDir: boolean;
+  size: number;
+  mtime: number;
+}
+
+function fmtSize(n: number): string {
+  if (!n) return '';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+/**
+ * 浏览网盘目录。扫码后先看清盘里有什么，再决定扫描——而不是只能盲扫。
+ * 目录为空时直接提示「可能是 drive_id 指向了另一个盘」。
+ */
+function BrowseDialog({ sourceId, onClose }: { sourceId: string; onClose: () => void }) {
+  const [entries, setEntries] = useState<BrowseEntry[]>([]);
+  const [stack, setStack] = useState<Array<{ id: string; name: string }>>([{ id: '', name: '根目录' }]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = async (parentId: string) => {
+    setLoading(true);
+    setErr(null);
+    try {
+      const r = await call<{ parent: string; entries: BrowseEntry[] }>(IPC.browseList, { sourceId, parentId });
+      setEntries(r.entries);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setEntries([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void load('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sourceId]);
+
+  const dirs = entries.filter((e) => e.isDir);
+  const files = entries.filter((e) => !e.isDir);
+
+  return (
+    <div className="modal" onClick={onClose}>
+      <div className="modal__panel" onClick={(e) => e.stopPropagation()}>
+        <h2>浏览网盘</h2>
+
+        <div className="browse-crumb">
+          {stack.map((seg, i) => (
+            <span key={`${seg.id}-${i}`}>
+              {i > 0 ? <span className="browse-crumb__sep">/</span> : null}
+              <button
+                onClick={() => {
+                  setStack((s) => s.slice(0, i + 1));
+                  void load(i === 0 ? '' : seg.id);
+                }}
+              >
+                {seg.name}
+              </button>
+            </span>
+          ))}
+        </div>
+
+        {loading ? <div className="status">加载中…</div> : null}
+        {err ? <div className="error">{err}</div> : null}
+
+        {!loading && !err && entries.length === 0 ? (
+          <div className="status status--warn">
+            这个目录没有内容。若你确定网盘里有文件，说明 API 拿到的 drive_id 指向了另一个盘——
+            在「添加存储源 → 阿里云盘」里填写网页版 F12 中看到的 drive_id 后重建源。
+          </div>
+        ) : null}
+
+        <ul className="browse-list">
+          {dirs.map((d) => (
+            <li key={d.path}>
+              <button
+                className="browse-row browse-row--dir"
+                onClick={() => {
+                  setStack((s) => [...s, { id: d.path, name: d.name }]);
+                  void load(d.path);
+                }}
+              >
+                <span className="browse-row__name">📁 {d.name}</span>
+              </button>
+            </li>
+          ))}
+          {files.map((f) => (
+            <li key={f.path}>
+              <div className="browse-row">
+                <span className="browse-row__name">🎬 {f.name}</span>
+                <span className="browse-row__meta">{fmtSize(f.size)}</span>
+              </div>
+            </li>
+          ))}
+        </ul>
+
+        <div className="modal__actions">
+          <span className="status">
+            {entries.length} 项（{dirs.length} 文件夹 / {files.length} 文件）
+          </span>
+          <button className="btn btn--ghost" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function AddSourceDialog({
   onClose,

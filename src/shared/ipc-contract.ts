@@ -14,6 +14,8 @@ export const IPC = {
   aliyunQrStart: 'aliyun:qr-start',
   aliyunQrPoll: 'aliyun:qr-poll',
 
+  browseList: 'browse:list',
+
   updateCheck: 'update:check',
   updateOpenRelease: 'update:open-release',
 

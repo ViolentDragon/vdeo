@@ -689,6 +689,27 @@ function registerIpc(): void {
     return provider.test();
   });
 
+  /**
+   * 浏览网盘目录：让用户在扫描前先看到盘里到底有什么。
+   * 之前只有「盲扫」，盘为空还是 id 不对都只能靠日志猜。
+   */
+  handle(IPC.browseList, async (payload: { sourceId: string; parentId?: string }) => {
+    const source = requireSource(payload.sourceId);
+    const provider = providerFor(source);
+    const parent = payload.parentId ?? '';
+    const entries = await provider.list(parent);
+    return {
+      parent: parent || String((source.config as { root?: unknown }).root ?? ''),
+      entries: entries.map((e) => ({
+        path: e.path,
+        name: e.name,
+        isDir: e.isDir,
+        size: e.size,
+        mtime: e.mtime,
+      })),
+    };
+  });
+
   handle(IPC.scanStart, async (payload: { sourceId?: string }) => {
     const targets = payload.sourceId
       ? [payload.sourceId]
