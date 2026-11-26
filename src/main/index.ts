@@ -140,6 +140,7 @@ async function runScan(sourceId: string): Promise<ScanSummary> {
   scanning.set(sourceId, ac);
 
   const onProgress = (p: ScanProgress) => broadcast(IPC.evScan, p);
+  log('[scan] 开始', source.name, `(${source.kind})`, 'root=', String((source.config as { root?: unknown }).root ?? ''));
   try {
     const summary = await scanSource({
       source,
@@ -149,6 +150,10 @@ async function runScan(sourceId: string): Promise<ScanSummary> {
       onProgress,
       signal: ac.signal,
     });
+    log('[scan] 完成', source.name, 'found=', summary.found, 'added=', summary.added, 'error=', summary.error ?? '无');
+    if (summary.found === 0 && !summary.error) {
+      log('[scan] 注意：遍历完成但一个媒体文件都没找到——检查网盘目录是否为空、扩展名是否在支持列表内');
+    }
     const updated: StorageSource = {
       ...source,
       lastScanAt: Date.now(),

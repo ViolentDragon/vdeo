@@ -1,4 +1,5 @@
 import QRCode from 'qrcode';
+import { log } from '../logger';
 
 /**
  * 阿里云盘扫码授权。
@@ -273,6 +274,8 @@ export interface DriveInfo {
   driveName: string;
   usedSize: number;
   totalSize: number;
+  /** 该账号下所有可用的 drive_id（默认盘 / 资源库 / 备份盘），按优先级排序 */
+  allDriveIds: string[];
 }
 
 /**
@@ -289,6 +292,10 @@ export async function getDriveInfo(accessToken: string): Promise<DriveInfo> {
     body: '{}',
   })) as Record<string, unknown>;
 
+  // 诊断：只记键名不记值。用来确认 v2/user/get 到底提供了哪几个 drive id，
+  // 以及资源库字段的真实名字（不同版本叫 resource_drive_id / resourceDriveId 等）。
+  log('[aliyun] v2/user/get 顶层键:', Object.keys(json).join(',') || '(空)');
+
   const driveId =
     (typeof json['default_drive_id'] === 'string' && json['default_drive_id']) ||
     (typeof json['resource_drive_id'] === 'string' && json['resource_drive_id']) ||
@@ -300,6 +307,17 @@ export async function getDriveInfo(accessToken: string): Promise<DriveInfo> {
 
   const toNum = (v: unknown): number => (typeof v === 'number' ? v : Number.isFinite(Number(v)) ? Number(v) : 0);
   const space = (json['space_info'] ?? {}) as Record<string, unknown>;
+
+  // 阿里云盘一个账号可能有多个 drive：default（默认盘）、resource（资源库）、backup（备份盘）。
+  // 用户媒体常在资源库，而 default_drive_id 往往指向备份盘——
+  // 只用一个 id 会出现「登录成功但 list 返回 0 项」。这里全部收集，供上层逐个尝试。
+  const allDriveIds: string[] = [];
+  for (const key of ['resource_drive_id', 'default_drive_id', 'backup_drive_id', 'drive_id']) {
+    const v = json[key];
+    if (typeof v === 'string' && v && !allDriveIds.includes(v)) allDriveIds.push(v);
+  }
+  if (!allDriveIds.includes(driveId)) allDriveIds.unshift(driveId);
+
   return {
     driveId,
     driveName:
@@ -308,5 +326,6 @@ export async function getDriveInfo(accessToken: string): Promise<DriveInfo> {
       '阿里云盘',
     usedSize: toNum(space['used_size']),
     totalSize: toNum(space['total_size']),
+    allDriveIds,
   };
 }

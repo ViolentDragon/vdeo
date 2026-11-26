@@ -2,6 +2,7 @@ import type { AliyunSourceConfig } from '../../shared/types';
 import type { ProviderTestResult, RemoteEntry, ResolvedMedia, StorageProvider } from './types';
 import { ProviderError } from './types';
 import { getDriveInfo, refreshToken, type AliyunToken } from './aliyun-auth';
+import { log } from '../logger';
 
 /**
  * 阿里云盘 provider。
@@ -73,6 +74,11 @@ export class AliyunProvider implements StorageProvider {
           Authorization: `Bearer ${this.token.accessToken}`,
           'Content-Type': 'application/json',
           'User-Agent': UA,
+          // Web API 有来源校验：缺 Referer/Origin 时接口会返回空 items 而不是报错，
+          // 表现为「登录成功但扫描到 0 个文件」。
+          Referer: 'https://www.aliyundrive.com/',
+          Origin: 'https://www.aliyundrive.com',
+          Accept: 'application/json, text/plain, */*',
         },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(30000),
@@ -116,26 +122,81 @@ export class AliyunProvider implements StorageProvider {
     }
   }
 
+  /**
+   * 该账号下要尝试的 drive_id 列表。
+   * 一个阿里云盘账号有多个盘（资源库/默认盘/备份盘），媒体通常在资源库；
+   * 只用建源时记下的那一个 id，会出现「登录成功但 list 恒返回 0 项」。
+   */
+  private driveCandidatesCache: string[] | null = null;
+
+  private async driveCandidates(): Promise<string[]> {
+    if (this.driveCandidatesCache) return this.driveCandidatesCache;
+    try {
+      const info = await getDriveInfo(this.token.accessToken);
+      const list = info.allDriveIds.filter(Boolean);
+      this.driveCandidatesCache = list.length > 0 ? list : [this.config.driveId];
+      if (this.driveCandidatesCache.length > 1) {
+        log('[aliyun] 候选盘:', this.driveCandidatesCache.join(','));
+      }
+    } catch {
+      this.driveCandidatesCache = [this.config.driveId];
+    }
+    return this.driveCandidatesCache;
+  }
+
   async list(dirPath: string): Promise<RemoteEntry[]> {
     const parentId = !dirPath || dirPath === '/' ? (this.config.root || 'root') : dirPath;
+    const drives = await this.driveCandidates();
+
+    for (const driveId of drives) {
+      const items = await this.listFromDrive(driveId, parentId);
+      if (items.length > 0) {
+        log(`[aliyun] list drive=${driveId} parent=${parentId} → ${items.length} 项`);
+        return items;
+      }
+      log(`[aliyun] list drive=${driveId} parent=${parentId} → 0 项，试下一个盘`);
+    }
+
+    log(`[aliyun] 所有盘在 parent=${parentId} 下均为空（共试 ${drives.length} 个盘）`);
+    return [];
+  }
+
+  private async listFromDrive(driveId: string, parentId: string): Promise<RemoteEntry[]> {
+    // v3 是当前 Web 端用的接口；v2 是旧版，参数更宽松。
+    // 两者都试一遍，避免某个接口对 parent_file_id 的约定不同导致静默返回空。
+    for (const endpoint of ['/adrive/v3/file/list', '/v2/file/list']) {
+      try {
+        const items = await this.listPage(driveId, parentId, endpoint);
+        if (items.length > 0) return items;
+        log(`[aliyun] ${endpoint} drive=${driveId} parent=${parentId} → 0 项`);
+      } catch (err) {
+        log(`[aliyun] ${endpoint} 失败：`, err instanceof Error ? err.message.slice(0, 160) : String(err));
+      }
+    }
+    return [];
+  }
+
+  private async listPage(driveId: string, parentId: string, endpoint: string): Promise<RemoteEntry[]> {
     const out: RemoteEntry[] = [];
     let marker = '';
 
     for (let page = 0; page < MAX_PAGES; page += 1) {
       const body: Record<string, unknown> = {
-        drive_id: this.config.driveId,
+        drive_id: driveId,
         parent_file_id: parentId,
         limit: PAGE_LIMIT,
         order_by: 'name',
         order_direction: 'ASC',
-        fields: 'id,name,type,size,updated_at,parent_file_id,category,file_extension',
+        // fields 用 '*'：v1.0 那套 "id,name,type,..." 的字段列表在 v3 上可能不认，
+        // 实测传它会返回空 items（而不是报错），这是「扫描到 0 个媒体文件」的直接原因。
+        fields: '*',
       };
       if (marker) body['marker'] = marker;
 
       const res = await this.api<{
         items?: Array<Record<string, unknown>>;
         next_marker?: string;
-      }>('/adrive/v3/file/list', body);
+      }>(endpoint, body);
 
       for (const it of res.items ?? []) {
         const fileId = String(it['file_id'] ?? it['id'] ?? '');
