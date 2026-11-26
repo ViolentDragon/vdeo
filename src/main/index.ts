@@ -18,7 +18,7 @@ import type {
 import { createRepository, type Repository } from './db';
 import { sourceId as newSourceId } from './db/ids';
 import { createProvider } from './sources/registry';
-import { getDriveInfo, pollQrLogin, startQrLogin, type QrSession } from './sources/aliyun-auth';
+import { getDriveInfo, listBizExtKeys, pollQrLogin, refreshToken, startQrLogin, type AliyunToken, type DriveInfo, type QrSession } from './sources/aliyun-auth';
 import { encryptSecret } from './sources/secrets';
 import { parentOf, type StorageProvider } from './sources/types';
 import { scanSource } from './scan/scanner';
@@ -525,14 +525,32 @@ function registerIpc(): void {
     if (!res.token) {
       throw new Error('已扫码确认，但未能从响应中解析出 token（接口结构可能已变化）');
     }
-    const drive = await getDriveInfo(res.token.accessToken);
+
+    // 诊断：只记字段名不记值。真实扫码后拿到的 bizExt 结构可能与预期不同。
+    const bizExtRaw = (res.raw as { bizExt?: unknown } | undefined)?.bizExt;
+    log('[aliyun] bizExt 字段名:', listBizExtKeys(bizExtRaw).join(',') || '(空/无法解析)');
+
+    // bizExt 里的 accessToken 很可能只是 passport 会话 token，直接拿来调 openapi 会得到
+    // TokenVerifyFailed: invalid access_token（实测）。正确做法是先用 refresh_token
+    // 走标准 OAuth 换一次 PDS 的 access_token，再调 getDriveInfo。
+    let token: AliyunToken = res.token;
+    let drive: DriveInfo;
+    try {
+      token = await refreshToken(res.token.refreshToken);
+      drive = await getDriveInfo(token.accessToken);
+      log('[aliyun] 已用 refresh_token 换取 access_token，drive_id =', drive.driveId);
+    } catch (refreshErr) {
+      log('[aliyun] refresh 换取失败，退回 bizExt accessToken：', refreshErr instanceof Error ? refreshErr.message : String(refreshErr));
+      drive = await getDriveInfo(token.accessToken);
+    }
+
     const config: AliyunSourceConfig = {
       kind: 'aliyun',
       driveId: drive.driveId,
-      refreshToken: encryptSecret(res.token.refreshToken),
-      accessToken: encryptSecret(res.token.accessToken),
-      expiresAt: res.token.expiresAt,
-      userName: res.token.userName ?? drive.driveName,
+      refreshToken: encryptSecret(token.refreshToken),
+      accessToken: encryptSecret(token.accessToken),
+      expiresAt: token.expiresAt,
+      userName: token.userName ?? drive.driveName,
       root: 'root',
     };
     const source: StorageSource = {

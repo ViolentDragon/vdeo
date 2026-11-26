@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { deepFindString, parseBizExt } from '../src/main/sources/aliyun-auth';
+import { deepFindString, listBizExtKeys, parseBizExt } from '../src/main/sources/aliyun-auth';
 
 /**
  * 只测纯解析逻辑（不联网）。
@@ -63,4 +63,25 @@ test('deepFindString：深度上限内查找，不无限递归', () => {
   // depth 上限 6，超过则找不到（防止畸形响应把栈打穿）
   assert.equal(deepFindString(deep, ['target']), null);
   assert.equal(deepFindString({ l1: { target: 'shallow' } }, ['target']), 'shallow');
+});
+
+test('listBizExtKeys：只输出字段名，不泄漏字段值', () => {
+  const payload = {
+    pds_login_result: { access_token: 'SECRET_VALUE_SHOULD_NOT_APPEAR', expires_in: 7200 },
+    nickName: 'x',
+  };
+  const keys = listBizExtKeys(Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'));
+  assert.ok(keys.includes('pds_login_result'), `缺少顶层键：${keys.join(',')}`);
+  assert.ok(keys.includes('pds_login_result.access_token'), '缺少嵌套键');
+  assert.ok(keys.includes('nickName'));
+  assert.equal(
+    keys.some((k) => k.includes('SECRET_VALUE')),
+    false,
+    '诊断日志只应包含键名，绝不能把 token 值写进日志',
+  );
+});
+
+test('listBizExtKeys：非法输入返回空数组而不抛异常', () => {
+  assert.deepEqual(listBizExtKeys(null), []);
+  assert.deepEqual(listBizExtKeys('not-base64!!'), []);
 });

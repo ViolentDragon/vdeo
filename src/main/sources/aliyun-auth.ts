@@ -187,6 +187,32 @@ function normalizeStatus(raw: unknown): QrStatus {
   return 'UNKNOWN';
 }
 
+/**
+ * 列出 bizExt 解码后的键名（只取键，绝不取值），用于诊断官方字段名变化。
+ * 真实扫码后若 token 校验失败，靠这个看出 bizExt 到底给了哪些字段。
+ */
+export function listBizExtKeys(bizExt: unknown): string[] {
+  let node: unknown = bizExt;
+  if (typeof bizExt === 'string') {
+    try {
+      node = JSON.parse(Buffer.from(bizExt, 'base64').toString('utf8')) as unknown;
+    } catch {
+      return [];
+    }
+  }
+  if (!node || typeof node !== 'object') return [];
+  const out: string[] = [];
+  const walk = (o: unknown, prefix: string, depth: number): void => {
+    if (depth > 2 || !o || typeof o !== 'object') return;
+    for (const [k, v] of Object.entries(o as Record<string, unknown>)) {
+      out.push(prefix + k);
+      if (v && typeof v === 'object') walk(v, `${prefix}${k}.`, depth + 1);
+    }
+  };
+  walk(node, '', 0);
+  return out;
+}
+
 /** 轮询扫码状态；CONFIRMED 时顺带解析出 token */
 export async function pollQrLogin(session: Pick<QrSession, 't' | 'ck'>): Promise<QrPollResult> {
   // 必须用 POST。实测对照：同一个会话 GET 返回 EXPIRED、POST 返回 NEW——
