@@ -131,15 +131,22 @@ export class AliyunProvider implements StorageProvider {
 
   private async driveCandidates(): Promise<string[]> {
     if (this.driveCandidatesCache) return this.driveCandidatesCache;
+    // config.driveId 优先：它可能来自用户在扫码时手填的「资源库 drive_id」。
+    // 实测 API（v2/user/get 与 v2/drive/get_default_drive）都只返回备份盘 id，
+    // 与网页版实际使用的不是同一个，因此必须允许人工指定。
+    const ids: string[] = [];
+    if (this.config.driveId) ids.push(this.config.driveId);
     try {
       const info = await getDriveInfo(this.token.accessToken);
-      const list = info.allDriveIds.filter(Boolean);
-      this.driveCandidatesCache = list.length > 0 ? list : [this.config.driveId];
-      if (this.driveCandidatesCache.length > 1) {
-        log('[aliyun] 候选盘:', this.driveCandidatesCache.join(','));
+      for (const id of info.allDriveIds) {
+        if (id && !ids.includes(id)) ids.push(id);
       }
     } catch {
-      this.driveCandidatesCache = [this.config.driveId];
+      /* 探测失败时沿用 config 里的 id */
+    }
+    this.driveCandidatesCache = ids.length > 0 ? ids : [this.config.driveId];
+    if (this.driveCandidatesCache.length > 1) {
+      log('[aliyun] 候选盘:', this.driveCandidatesCache.join(' → '));
     }
     return this.driveCandidatesCache;
   }

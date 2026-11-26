@@ -534,7 +534,7 @@ function registerIpc(): void {
     return { sessionId: session.id, qrDataUrl: session.qrDataUrl, expiresInSec: 180 };
   });
 
-  handle(IPC.aliyunQrPoll, async (payload: { sessionId: string; name?: string }) => {
+  handle(IPC.aliyunQrPoll, async (payload: { sessionId: string; name?: string; driveId?: string }) => {
     const session = qrSessions.get(payload.sessionId);
     if (!session) {
       log('[aliyun] 轮询时 session 已不存在:', payload.sessionId);
@@ -585,7 +585,9 @@ function registerIpc(): void {
 
     const config: AliyunSourceConfig = {
       kind: 'aliyun',
-      driveId: drive.driveId,
+      // 用户在扫码框里手填的 drive_id 优先：API 只返回备份盘 id，
+      // 与网页端实际使用的资源库 id 可能不同（实测 2624585230 vs 1304585230）。
+      driveId: (payload.driveId ?? '').trim() || drive.driveId,
       refreshToken: encryptSecret(token.refreshToken),
       accessToken: encryptSecret(token.accessToken),
       expiresAt: token.expiresAt,

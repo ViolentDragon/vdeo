@@ -1103,10 +1103,15 @@ function AddSourceDialog({
   const [qr, setQr] = useState<{ sessionId: string; dataUrl: string } | null>(null);
   const [qrStatus, setQrStatus] = useState('');
   const [qrBusy, setQrBusy] = useState(false);
+  const [driveIdOverride, setDriveIdOverride] = useState('');
   const nameRef = useRef(name);
+  const driveIdRef = useRef(driveIdOverride);
   useEffect(() => {
     nameRef.current = name;
   }, [name]);
+  useEffect(() => {
+    driveIdRef.current = driveIdOverride;
+  }, [driveIdOverride]);
 
   const addLocal = async () => {
     try {
@@ -1145,6 +1150,7 @@ function AddSourceDialog({
         const r = await call<{ status: string }>(IPC.aliyunQrPoll, {
           sessionId: qr.sessionId,
           name: nameRef.current.trim() || undefined,
+          driveId: driveIdRef.current.trim() || undefined,
         });
         if (stopped) return;
         if (r.status === 'NEW') setQrStatus('等待扫码…');
@@ -1262,6 +1268,19 @@ function AddSourceDialog({
           </>
         ) : (
           <>
+            <div className="field">
+              <label>资源库 drive_id（通常留空）</label>
+              <input
+                className="input"
+                value={driveIdOverride}
+                onChange={(e) => setDriveIdOverride(e.target.value)}
+                placeholder="仅在扫描结果为 0 项时才需要填写"
+              />
+              <small>
+                阿里云盘 API 只返回备份盘 id，与网页版实际使用的「资源库」可能不同。若扫描后显示 0
+                项：打开网页版按 F12 → Network，任一请求里的 <code>drive_id</code> 就是要填的值。
+              </small>
+            </div>
             <div className="field">
               <label>扫码授权</label>
               <small>用<strong>阿里云盘 App</strong>扫描下方二维码，在手机上点确认，即可自动挂载到本应用。</small>

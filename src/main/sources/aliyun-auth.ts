@@ -328,6 +328,27 @@ export async function getDriveInfo(accessToken: string): Promise<DriveInfo> {
   }
   if (!allDriveIds.includes(driveId)) allDriveIds.unshift(driveId);
 
+  // 实测：v2/user/get 的 default_drive_id 与网页版实际使用的 drive_id 不是同一个
+  // （用户账号：API 给 2624585230，网页端请求里是 1304585230），
+  // 导致 root 合法但 list 恒返回 0 项。这里额外问一次 get_default_drive，
+  // 把它的结果排在最前优先尝试。
+  try {
+    const d = (await getJson('https://api.aliyundrive.com/v2/drive/get_default_drive', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    })) as Record<string, unknown>;
+    const preferred = String(d['drive_id'] ?? d['default_drive_id'] ?? '');
+    if (preferred) {
+      log('[aliyun] v2/drive/get_default_drive →', preferred);
+      if (!allDriveIds.includes(preferred)) allDriveIds.unshift(preferred);
+      else allDriveIds.sort((a, b) => (a === preferred ? -1 : b === preferred ? 1 : 0));
+    }
+  } catch (err) {
+    log('[aliyun] v2/drive/get_default_drive 失败:', err instanceof Error ? err.message.slice(0, 120) : String(err));
+  }
+  log('[aliyun] 候选 drive_id 顺序:', allDriveIds.join(' → '));
+
   return {
     driveId,
     driveName:
