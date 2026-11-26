@@ -28,6 +28,7 @@ export interface StorageProvider {
   list(dirPath: string): Promise<RemoteEntry[]>;
   /** 交给 mpv / 外部播放器的地址；某些网盘需要附带请求头 */
   resolvePlayUrl(path: string): Promise<ResolvedMedia>;
+  getArtwork?(path: string, video: boolean): Promise<ResolvedMedia | null>;
   /** 读取小文本（.nfo 等），不支持时返回 null */
   readText?(path: string, maxBytes?: number): Promise<string | null>;
 }

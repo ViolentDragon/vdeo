@@ -1,9 +1,11 @@
 import { openDatabase, type SqliteHandle, type SqlValue } from './sqlite';
-import { DDL_V1, SCHEMA_VERSION } from './schema';
+import { DDL_V1, DDL_V2, DDL_V3, SCHEMA_VERSION } from './schema';
 import type {
   AppSettings,
   BrowseQuery,
   BrowseResult,
+  CatalogEntry,
+  Genre,
   LibrarySection,
   MediaItem,
   PlaybackRecord,
@@ -12,6 +14,7 @@ import type {
   SourceKind,
   StorageSource,
 } from '../../shared/types';
+import { GENRES } from '../../shared/types';
 
 type Row = Record<string, unknown>;
 
@@ -26,6 +29,19 @@ const num = (v: unknown): number | null => {
 };
 const mustNum = (v: unknown, fallback = 0): number => num(v) ?? fallback;
 const bool = (v: unknown): boolean => mustNum(v) === 1;
+const EPISODE_KEY = 'COALESCE(season, 1), COALESCE(episode, -1), COALESCE(episode_end, episode, -1)';
+const FILE_PREFERENCE = `CASE resolution WHEN '2160p' THEN 4 WHEN '1080p' THEN 3 WHEN '720p' THEN 2 ELSE 1 END DESC,
+                         size DESC, id`;
+const FIRST_EPISODE_ORDER = 'CASE WHEN season = 0 THEN 1 ELSE 0 END, COALESCE(season, 1), episode IS NULL, episode, episode_end, id';
+const WORK_KEY = `CASE
+  WHEN series_key IS NOT NULL THEN 'series:' || series_key
+  WHEN section = 'movie' THEN 'movie:' || lower(replace(replace(trim(title), ' ', ''), '·', '')) || '#' || COALESCE(year, '')
+  ELSE id END`;
+
+function readGenres(value: unknown): Genre[] {
+  const entries: unknown = JSON.parse(mustStr(value, '[]'));
+  return Array.isArray(entries) ? GENRES.filter((genre) => entries.includes(genre)) : [];
+}
 
 function rowToItem(row: Row): MediaItem {
   return {
@@ -44,6 +60,7 @@ function rowToItem(row: Row): MediaItem {
     episodeEnd: num(row['episode_end']),
     seriesKey: str(row['series_key']),
     seriesTitle: str(row['series_title']),
+    genres: readGenres(row['genres']),
     resolution: str(row['resolution']),
     quality: str(row['quality']),
     videoCodec: str(row['video_codec']),
@@ -51,6 +68,7 @@ function rowToItem(row: Row): MediaItem {
     releaseGroup: str(row['release_group']),
     confidence: mustNum(row['confidence']),
     poster: str(row['poster']),
+    posterItemId: str(row['poster_item_id']),
     backdrop: str(row['backdrop']),
     overview: str(row['overview']),
     rating: num(row['rating']),
@@ -99,6 +117,7 @@ const ITEM_COLUMNS = [
   'episode_end',
   'series_key',
   'series_title',
+  'genres',
   'resolution',
   'quality',
   'video_codec',
@@ -106,6 +125,7 @@ const ITEM_COLUMNS = [
   'release_group',
   'confidence',
   'poster',
+  'poster_item_id',
   'backdrop',
   'overview',
   'rating',
@@ -134,6 +154,7 @@ function itemValues(it: MediaItem): SqlValue[] {
     it.episodeEnd,
     it.seriesKey,
     it.seriesTitle,
+    JSON.stringify(it.genres ?? []),
     it.resolution,
     it.quality,
     it.videoCodec,
@@ -141,6 +162,7 @@ function itemValues(it: MediaItem): SqlValue[] {
     it.releaseGroup,
     it.confidence,
     it.poster,
+    it.posterItemId ?? null,
     it.backdrop,
     it.overview,
     it.rating,
@@ -173,6 +195,7 @@ ON CONFLICT(source_id, path) DO UPDATE SET
   episode_end = excluded.episode_end,
   series_key = excluded.series_key,
   series_title = excluded.series_title,
+  genres = excluded.genres,
   resolution = excluded.resolution,
   quality = excluded.quality,
   video_codec = excluded.video_codec,
@@ -180,6 +203,7 @@ ON CONFLICT(source_id, path) DO UPDATE SET
   release_group = excluded.release_group,
   confidence = excluded.confidence,
   poster = COALESCE(items.poster, excluded.poster),
+  poster_item_id = excluded.poster_item_id,
   backdrop = COALESCE(items.backdrop, excluded.backdrop),
   overview = COALESCE(items.overview, excluded.overview),
   rating = COALESCE(items.rating, excluded.rating),
@@ -202,11 +226,13 @@ export interface Repository {
   clearSourceItems(sourceId: string): void;
 
   beginScan(sourceId: string): void;
+  finishScan(sourceId: string, seenItemIds: ReadonlySet<string>): void;
   upsertItems(items: MediaItem[]): { added: number; updated: number };
   getItem(id: string): MediaItem | null;
   getItemsByIds(ids: string[]): MediaItem[];
   browse(query: BrowseQuery): BrowseResult;
   getSeries(key: string): { summary: SeriesSummary; items: MediaItem[] } | null;
+  updateWorkGenres(workKey: string, genres: Genre[] | null): void;
   sectionCounts(): Array<{ section: LibrarySection; count: number }>;
   countItems(): number;
   updateItemMeta(id: string, meta: Partial<Pick<MediaItem, 'poster' | 'backdrop' | 'overview' | 'rating' | 'durationSec' | 'width' | 'height' | 'year' | 'title'>>): void;
@@ -227,9 +253,18 @@ export function createRepository(file: string): Repository {
   db.exec('PRAGMA foreign_keys = ON');
 
   const version = mustNum(db.prepare('PRAGMA user_version').get()?.['user_version'], 0);
-  if (version < 1) {
-    db.exec(DDL_V1);
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  if (version < SCHEMA_VERSION) {
+    db.exec('BEGIN');
+    try {
+      if (version < 1) db.exec(DDL_V1);
+      if (version < 2) db.exec(DDL_V2);
+      if (version < 3) db.exec(DDL_V3);
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
   }
 
   const upsertStmt = db.prepare(UPSERT_ITEM_SQL);
@@ -305,6 +340,13 @@ export function createRepository(file: string): Repository {
       db.prepare('UPDATE items SET missing = 1 WHERE source_id = ?').run(sourceId);
     },
 
+    finishScan(sourceId, seenItemIds) {
+      db.prepare(
+        `UPDATE items SET missing = 1
+         WHERE source_id = ? AND missing = 0 AND id NOT IN (SELECT value FROM json_each(?))`,
+      ).run(sourceId, JSON.stringify([...seenItemIds]));
+    },
+
     upsertItems(items) {
       if (items.length === 0) return { added: 0, updated: 0 };
       const existing = new Set<string>();
@@ -345,61 +387,35 @@ export function createRepository(file: string): Repository {
     },
 
     browse(query) {
-      const buildWhere = (p: string): { sql: string; params: SqlValue[] } => {
-        const parts: string[] = [`${p}missing = 0`];
-        const params: SqlValue[] = [];
-        if (query.section) {
-          parts.push(`${p}section = ?`);
-          params.push(query.section);
-        }
-        if (query.sourceId) {
-          parts.push(`${p}source_id = ?`);
-          params.push(query.sourceId);
-        }
-        if (query.search && query.search.trim()) {
-          parts.push(`(${p}title LIKE ? OR ${p}series_title LIKE ? OR ${p}name LIKE ?)`);
-          const like = `%${query.search.trim()}%`;
-          params.push(like, like, like);
-        }
-        return { sql: parts.join(' AND '), params };
-      };
       const group = query.group ?? 'item';
-      const itemWhere = buildWhere('');
-      const whereSql = itemWhere.sql;
-      const params = itemWhere.params;
-
-      if (group === 'series') {
-        const seriesWhere = buildWhere('i1.');
-        const series = db
-          .prepare(
-            `SELECT series_key AS sk,
-                    COALESCE(MAX(series_title), MAX(title)) AS title,
-                    MAX(year) AS year,
-                    MAX(section) AS section,
-                    GROUP_CONCAT(DISTINCT source_id) AS source_ids,
-                    COUNT(*) AS episode_count,
-                    COUNT(DISTINCT season) AS season_count,
-                    GROUP_CONCAT(DISTINCT season) AS seasons,
-                    MAX(added_at) AS latest_added_at,
-                    MAX(rating) AS rating,
-                    (SELECT i2.poster FROM items i2 WHERE i2.series_key = i1.series_key AND i2.poster IS NOT NULL LIMIT 1) AS poster,
-                    (SELECT MAX(i3.episode) FROM items i3 JOIN playback pb ON pb.item_id = i3.id WHERE i3.series_key = i1.series_key AND pb.finished = 0) AS last_watched_episode
-             FROM items i1
-             WHERE ${seriesWhere.sql}
-               AND series_key IS NOT NULL
-             GROUP BY i1.series_key
-             ORDER BY latest_added_at DESC`,
-          )
-          .all(...seriesWhere.params)
-          .map(rowToSeries);
-
-        const total = series.length;
-        const offset = query.offset ?? 0;
-        const limit = query.limit ?? 500;
-        return { total, items: [], series: series.slice(offset, offset + limit) };
+      const scope = ['missing = 0'];
+      const scopeParams: SqlValue[] = [];
+      if (query.section) {
+        scope.push('section = ?');
+        scopeParams.push(query.section);
       }
+      if (query.sourceId) {
+        scope.push('source_id = ?');
+        scopeParams.push(query.sourceId);
+      }
+      if (group === 'series') scope.push('series_key IS NOT NULL');
+      // 首页的片库独立于音乐和照片分区。
+      if (group === 'catalog' && !query.section) scope.push("section IN ('movie', 'tv', 'anime')");
 
-      const total = mustNum(db.prepare(`SELECT COUNT(*) AS c FROM items WHERE ${whereSql}`).get(...params)?.['c']);
+      const filters: string[] = [];
+      const filterParams: SqlValue[] = [];
+      if (query.search?.trim()) {
+        const like = `%${query.search.trim().replace(/[\\%_]/g, '\\$&')}%`;
+        filters.push("(title LIKE ? ESCAPE '\\' OR series_title LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')");
+        filterParams.push(like, like, like);
+      }
+      const genreColumn = group === 'item' ? 'genres' : 'effective_genres';
+      if (query.genre === 'untagged') {
+        filters.push(`json_array_length(${genreColumn}) = 0`);
+      } else if (query.genre) {
+        filters.push(`EXISTS (SELECT 1 FROM json_each(${genreColumn}) WHERE value = ?)`);
+        filterParams.push(query.genre);
+      }
       const orderCol = {
         added: 'added_at',
         title: 'title',
@@ -410,6 +426,73 @@ export function createRepository(file: string): Repository {
       const order = query.order === 'asc' ? 'ASC' : 'DESC';
       const limit = query.limit ?? 200;
       const offset = query.offset ?? 0;
+      const params = [...scopeParams, ...filterParams];
+      if (group !== 'item') {
+        const matchingFilter = query.genre === 'untagged'
+          ? [...filters.slice(0, -1), 'work_key NOT IN (SELECT work_key FROM scoped WHERE json_array_length(effective_genres) > 0)']
+          : filters;
+        const cte = `WITH candidates AS (
+          SELECT *, ${WORK_KEY} AS work_key FROM items WHERE ${scope.join(' AND ')}
+        ), scoped AS (
+          SELECT candidates.*, COALESCE(work_genres.genres, candidates.genres) AS effective_genres
+          FROM candidates LEFT JOIN work_genres USING (work_key)
+        ), matches AS (
+          SELECT DISTINCT work_key FROM scoped ${matchingFilter.length ? `WHERE ${matchingFilter.join(' AND ')}` : ''}
+        )`;
+        const total = mustNum(db.prepare(`${cte} SELECT COUNT(*) AS c FROM matches`).get(...params)?.['c']);
+        const rows = db.prepare(`${cte}, ranked AS (
+          SELECT scoped.*, ROW_NUMBER() OVER (
+            PARTITION BY work_key, ${EPISODE_KEY} ORDER BY ${FILE_PREFERENCE}
+          ) AS preference
+          FROM scoped JOIN matches USING (work_key)
+        ), preferred AS (
+          SELECT ranked.*, ROW_NUMBER() OVER (PARTITION BY work_key ORDER BY ${FIRST_EPISODE_ORDER}) AS cover_rank
+          FROM ranked WHERE preference = 1
+        ), cards AS (
+          SELECT work_key, MAX(series_key) AS sk, MAX(CASE WHEN cover_rank = 1 THEN id END) AS artwork_id,
+                 COALESCE(MAX(series_title), MAX(title)) AS title,
+                 MIN(year) AS year, MAX(section) AS section,
+                 GROUP_CONCAT(DISTINCT source_id) AS source_ids,
+                 COUNT(*) AS episode_count, COUNT(DISTINCT COALESCE(season, 1)) AS season_count,
+                 GROUP_CONCAT(DISTINCT COALESCE(season, 1)) AS seasons,
+                 MAX(added_at) AS added_at, MAX(rating) AS rating, MIN(episode) AS episode,
+                 MAX(poster) AS poster
+          FROM preferred GROUP BY work_key
+          ORDER BY ${orderCol} ${order}, title ASC, work_key ASC LIMIT ? OFFSET ?
+        ) SELECT cards.*,
+          (SELECT MAX(i.episode) FROM items i JOIN playback p ON p.item_id = i.id
+           WHERE i.series_key = cards.sk AND i.missing = 0 AND p.finished = 0) AS last_watched_episode,
+          (SELECT s.poster_item_id FROM scoped s
+           WHERE s.work_key = cards.work_key AND s.poster_item_id IS NOT NULL
+           ORDER BY CASE WHEN s.id = cards.artwork_id THEN 0 ELSE 1 END, s.poster_item_id LIMIT 1) AS poster_item_id,
+          (SELECT json_group_array(DISTINCT value) FROM scoped JOIN json_each(scoped.effective_genres)
+           WHERE scoped.work_key = cards.work_key) AS genres
+        FROM cards ORDER BY ${orderCol} ${order}, title ASC, work_key ASC`).all(...params, limit, offset);
+
+        const itemById = new Map(repo.getItemsByIds(rows.filter((row) => row['sk'] === null).map((row) => mustStr(row['artwork_id'])))
+          .map((item) => [item.id, item]));
+        const entries: CatalogEntry[] = [];
+        const series: SeriesSummary[] = [];
+        const items: MediaItem[] = [];
+        for (const row of rows) {
+          if (row['sk'] !== null) {
+            const summary = rowToSeries(row);
+            series.push(summary);
+            entries.push({ kind: 'series', series: summary, workKey: mustStr(row['work_key']) });
+          } else {
+            const item = itemById.get(mustStr(row['artwork_id']));
+            if (!item) continue;
+            item.genres = readGenres(row['genres']);
+            item.posterItemId = str(row['poster_item_id']);
+            items.push(item);
+            entries.push({ kind: 'item', item, workKey: mustStr(row['work_key']) });
+          }
+        }
+        return { total, entries, series, items };
+      }
+
+      const whereSql = [...scope, ...filters].join(' AND ');
+      const total = mustNum(db.prepare(`SELECT COUNT(*) AS c FROM items WHERE ${whereSql}`).get(...params)?.['c']);
       const items = db
         .prepare(
           `SELECT * FROM items WHERE ${whereSql} ORDER BY ${orderCol} ${order}, title ASC LIMIT ? OFFSET ?`,
@@ -422,27 +505,55 @@ export function createRepository(file: string): Repository {
     getSeries(key) {
       const rows = db
         .prepare(
-          `SELECT * FROM items WHERE series_key = ? AND missing = 0 ORDER BY season ASC, episode ASC`,
+          `WITH ranked AS (
+             SELECT items.*, ROW_NUMBER() OVER (PARTITION BY ${EPISODE_KEY} ORDER BY ${FILE_PREFERENCE}) AS preference
+             FROM items WHERE series_key = ? AND missing = 0
+           ) SELECT * FROM ranked WHERE preference = 1 ORDER BY ${FIRST_EPISODE_ORDER}`,
         )
         .all(key)
         .map(rowToItem);
       if (rows.length === 0) return null;
       const first = rows[0]!;
-      const seasons = [...new Set(rows.map((r) => r.season ?? 0))].sort((a, b) => a - b);
+      const seasons = [...new Set(rows.map((r) => r.season ?? 1))].sort((a, b) => a - b);
+      const info = db.prepare(`SELECT MIN(year) AS year, MAX(poster) AS poster, MAX(added_at) AS added_at,
+                               GROUP_CONCAT(DISTINCT source_id) AS source_ids
+                               FROM items WHERE series_key = ? AND missing = 0`).get(key);
+      const posterItemId = db.prepare(`SELECT poster_item_id FROM items
+        WHERE series_key = ? AND missing = 0 AND poster_item_id IS NOT NULL
+        ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, poster_item_id LIMIT 1`).get(key, first.id);
+      const genres = db.prepare(`SELECT DISTINCT value FROM items JOIN json_each(items.genres)
+                                 WHERE series_key = ? AND missing = 0`).all(key).map((row) => row['value']);
+      const override = db.prepare('SELECT genres FROM work_genres WHERE work_key = ?').get(`series:${key}`);
       const summary: SeriesSummary = {
         key,
         title: first.seriesTitle ?? first.title,
-        year: first.year,
+        year: num(info?.['year']),
         section: first.section,
-        sourceIds: [...new Set(rows.map((r) => r.sourceId))],
+        sourceIds: mustStr(info?.['source_ids']).split(',').filter(Boolean),
         episodeCount: rows.length,
         seasonCount: seasons.length,
         seasons,
-        poster: rows.find((r) => r.poster)?.poster ?? null,
-        latestAddedAt: Math.max(...rows.map((r) => r.addedAt)),
+        poster: str(info?.['poster']),
+        posterItemId: str(posterItemId?.['poster_item_id']),
+        artworkId: first.id,
+        genres: override ? readGenres(override['genres']) : GENRES.filter((genre) => genres.includes(genre)),
+        latestAddedAt: mustNum(info?.['added_at']),
         lastWatchedEpisode: null,
       };
       return { summary, items: rows };
+    },
+
+    updateWorkGenres(workKey, genres) {
+      if (!db.prepare(`SELECT 1 FROM items WHERE missing = 0 AND ${WORK_KEY} = ? LIMIT 1`).get(workKey)) {
+        throw new Error('作品已移除或尚未入库');
+      }
+      if (genres === null) {
+        db.prepare('DELETE FROM work_genres WHERE work_key = ?').run(workKey);
+      } else {
+        db.prepare(`INSERT INTO work_genres (work_key, genres) VALUES (?, ?)
+                    ON CONFLICT (work_key) DO UPDATE SET genres = excluded.genres`)
+          .run(workKey, JSON.stringify(GENRES.filter((genre) => genres.includes(genre))));
+      }
     },
 
     sectionCounts() {
@@ -514,9 +625,11 @@ export function createRepository(file: string): Repository {
     continueWatching(limit) {
       const rows = db
         .prepare(
-          `SELECT p.* FROM playback p JOIN items i ON i.id = p.item_id
-           WHERE p.finished = 0 AND p.position > 20 AND i.missing = 0
-           ORDER BY p.updated_at DESC LIMIT ?`,
+          `SELECT * FROM (
+             SELECT p.*, ROW_NUMBER() OVER (PARTITION BY COALESCE(i.series_key, i.id) ORDER BY p.updated_at DESC) AS preference
+             FROM playback p JOIN items i ON i.id = p.item_id
+             WHERE p.finished = 0 AND p.position > 20 AND i.missing = 0
+           ) WHERE preference = 1 ORDER BY updated_at DESC LIMIT ?`,
         )
         .all(limit);
       const out: Array<{ item: MediaItem; record: PlaybackRecord }> = [];
@@ -578,7 +691,10 @@ function rowToSeries(row: Row): SeriesSummary {
     seasonCount: mustNum(row['season_count']),
     seasons,
     poster: str(row['poster']),
-    latestAddedAt: mustNum(row['latest_added_at']),
+    posterItemId: str(row['poster_item_id']),
+    artworkId: mustStr(row['artwork_id']),
+    genres: readGenres(row['genres']),
+    latestAddedAt: mustNum(row['added_at']),
     lastWatchedEpisode: num(row['last_watched_episode']),
   };
 }

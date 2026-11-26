@@ -1,15 +1,19 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu, nativeImage, shell } from 'electron';
 import { join, dirname } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { readFile, stat } from 'node:fs/promises';
 import { initLogger, log } from './logger';
-import { IPC, type Rpc } from '../shared/ipc-contract';
+import { IPC, type LocalPathMode, type Rpc } from '../shared/ipc-contract';
+import { listLocalPaths } from './local-paths';
 import { DEFAULT_PLAYER_CONFIG } from '../shared/types';
 import type {
   AliyunSourceConfig,
   AppSettings,
   BrowseQuery,
+  Genre,
   MediaItem,
   ScanProgress,
+  ScanScope,
   ScanSummary,
   SourceConfig,
   SourceKind,
@@ -23,18 +27,25 @@ import { getDriveInfo, listBizExtKeys, pollQrLogin, refreshToken, startQrLogin, 
 import { encryptSecret } from './sources/secrets';
 import { parentOf, type StorageProvider } from './sources/types';
 import { scanSource } from './scan/scanner';
+import { listSourceDirectory, validateScanScope } from './scan/scope';
 import { AUDIO_EXTS, IMAGE_EXTS, SUBTITLE_EXTS, VIDEO_EXTS } from './scan/namer';
 import { locateMpv } from './player/locate';
 import { detectExternalPlayers, migrateLegacyCommand, resolveExternalLaunch, splitArgs } from './player/external';
 import { MpvController } from './player/mpv';
+import { captureFirstVisibleFrame } from './player/cover';
 
 let win: BrowserWindow | null = null;
+let startupError: string | undefined;
 let repo: Repository;
 let settings: AppSettings;
 let controller: MpvController | null = null;
 let mpvPath: string | null = null;
 const scanning = new Map<string, AbortController>();
 const qrSessions = new Map<string, QrSession>();
+const aliyunProviders = new Map<string, StorageProvider>();
+const artworkCache = new Map<string, { expires: number; result: Promise<string | null> }>();
+const POSTER_MIME: Record<string, string> = { jpeg: 'image/jpeg', jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', bmp: 'image/bmp' };
+const POSTER_MAX_BYTES = 5_000_000;
 
 const DEFAULT_SETTINGS: AppSettings = {
   mpvPath: null,
@@ -111,10 +122,83 @@ function requireItem(id: string): MediaItem {
   return item;
 }
 
+function libraryArtwork(id: string): Promise<string | null> {
+  const item = requireItem(id);
+  if (item.missing) return Promise.resolve(null);
+  const key = `${id}:${item.mtime}`;
+  const cached = artworkCache.get(key);
+  if (cached && cached.expires > Date.now()) return cached.result;
+  const result = (async () => {
+    const video = isVideo(item);
+    if (!video && !IMAGE_EXTS.has(item.ext)) return null;
+    const source = requireSource(item.sourceId);
+    const provider = providerFor(source);
+    const artwork = await provider.getArtwork?.(item.path, video).catch(() => null);
+    const image = artwork ? await fetchArtwork(artwork).catch(() => null) : null;
+    if (video) {
+      if (!item.seriesKey) return image;
+      if (image && hasVisibleFrame(image)) return image;
+      return mpvPath ? captureFirstVisibleFrame(mpvPath, await provider.resolvePlayUrl(item.path)) : null;
+    }
+    if (image) return image;
+    const type = POSTER_MIME[item.ext];
+    if (!type) return null;
+    if (source.kind === 'local') {
+      if ((await stat(item.path)).size > POSTER_MAX_BYTES) return null;
+      return `data:${type};base64,${(await readFile(item.path)).toString('base64')}`;
+    }
+    if (source.kind === 'webdav') return fetchArtwork(await provider.resolvePlayUrl(item.path), type);
+    return null;
+  })().catch(() => null);
+  if (artworkCache.size >= 80) artworkCache.delete(artworkCache.keys().next().value!);
+  artworkCache.set(key, { expires: Date.now() + 5 * 60_000, result });
+  return result;
+}
+
+function hasVisibleFrame(data: string): boolean {
+  const image = nativeImage.createFromDataURL(data);
+  if (image.isEmpty()) return false;
+  const bitmap = image.resize({ width: 64 }).toBitmap();
+  let lit = 0;
+  for (let i = 0; i < bitmap.length; i += 4) {
+    const luminance = 0.0722 * bitmap[i]! + 0.7152 * bitmap[i + 1]! + 0.2126 * bitmap[i + 2]!;
+    if (luminance > 12) lit += 1;
+  }
+  return lit > bitmap.length / 400;
+}
+
+async function fetchArtwork(artwork: { url: string; headers: Record<string, string> }, webdavType?: string): Promise<string | null> {
+  const url = new URL(artwork.url);
+  if (!webdavType && !/(^|\.)(alipan\.com|aliyundrive\.(com|net)|alicdn\.com|aliyunpds\.com|aliyuncs\.com)$/.test(url.hostname)) return null;
+  const response = await fetch(url, { headers: artwork.headers, redirect: 'error', signal: AbortSignal.timeout(10000) });
+  const type = webdavType ?? response.headers.get('content-type') ?? '';
+  if (!response.ok || !/^image\/(jpeg|png|webp|gif|bmp)$/.test(type) || !response.body) {
+    await response.body?.cancel();
+    return null;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > (webdavType ? POSTER_MAX_BYTES : 600_000)) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  return `data:${type};base64,${Buffer.concat(chunks).toString('base64')}`;
+}
+
 /** 统一的 provider 工厂：阿里云盘 token 轮换后必须写回数据库，否则重启即失效 */
 function providerFor(source: StorageSource): ReturnType<typeof createProvider> {
-  return createProvider(source, {
+  const cached = aliyunProviders.get(source.id);
+  if (cached) return cached;
+  const provider = createProvider(source, {
     onAliyunTokenRefreshed: (sourceId, token) => {
+      if (aliyunProviders.get(sourceId) !== provider) return;
       const s = repo.getSource(sourceId);
       if (!s || s.config.kind !== 'aliyun') return;
       const cfg = s.config as AliyunSourceConfig;
@@ -128,6 +212,8 @@ function providerFor(source: StorageSource): ReturnType<typeof createProvider> {
       log('[aliyun] access_token 已刷新并写回');
     },
   });
+  if (source.kind === 'aliyun') aliyunProviders.set(source.id, provider);
+  return provider;
 }
 
 /* ----------------------------- 扫描 ----------------------------- */
@@ -135,6 +221,7 @@ function providerFor(source: StorageSource): ReturnType<typeof createProvider> {
 async function runScan(sourceId: string): Promise<ScanSummary> {
   const source = requireSource(sourceId);
   if (scanning.has(sourceId)) throw new Error('该源正在扫描中');
+  if (source.config.scanScope?.mode === 'pending') throw new Error('请先设置该存储源的扫描范围');
   const provider = providerFor(source);
   const ac = new AbortController();
   scanning.set(sourceId, ac);
@@ -154,13 +241,15 @@ async function runScan(sourceId: string): Promise<ScanSummary> {
     if (summary.found === 0 && !summary.error) {
       log('[scan] 注意：遍历完成但一个媒体文件都没找到——检查网盘目录是否为空、扩展名是否在支持列表内');
     }
-    const updated: StorageSource = {
-      ...source,
-      lastScanAt: Date.now(),
-      lastScanCount: summary.found,
-      lastError: summary.error,
-    };
-    repo.updateSource(updated);
+    const current = repo.getSource(sourceId);
+    if (current) {
+      repo.updateSource({
+        ...current,
+        lastScanAt: Date.now(),
+        lastScanCount: summary.found,
+        lastError: summary.error,
+      });
+    }
     broadcast(IPC.evLibrary, { reason: 'scan-done', sourceId, summary });
     return summary;
   } finally {
@@ -343,13 +432,13 @@ function createWindow(): void {
   win = new BrowserWindow({
     width: 1400,
     height: 900,
-    minWidth: 1024,
-    minHeight: 640,
-    backgroundColor: '#0a0d14',
+    minWidth: 720,
+    minHeight: 560,
+    backgroundColor: '#121319',
     show: false,
     autoHideMenuBar: true,
     titleBarStyle: 'hidden',
-    titleBarOverlay: { color: '#0a0d14', symbolColor: '#9aa6b8', height: 36 },
+    titleBarOverlay: { color: '#121319', symbolColor: '#b4b6c2', height: 36 },
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -457,7 +546,15 @@ function createWindow(): void {
 
 
   const devUrl = process.env['VITE_DEV_SERVER_URL'];
-  if (devUrl) {
+  if (startupError) {
+    if (devUrl) {
+      const url = new URL(devUrl);
+      url.searchParams.set('startupError', startupError);
+      void win.loadURL(url.toString());
+    } else {
+      void win.loadFile(join(__dirname, '../renderer/index.html'), { query: { startupError } });
+    }
+  } else if (devUrl) {
     void win.loadURL(devUrl);
     win.webContents.openDevTools({ mode: 'detach' });
   } else {
@@ -592,8 +689,6 @@ function registerIpc(): void {
 
     const config: AliyunSourceConfig = {
       kind: 'aliyun',
-      // 用户在扫码框里手填的 drive_id 优先：API 只返回备份盘 id，
-      // 与网页端实际使用的资源库 id 可能不同（实测 2624585230 vs 1304585230）。
       driveId: (payload.driveId ?? '').trim() || drive.driveId,
       refreshToken: encryptSecret(token.refreshToken),
       accessToken: encryptSecret(token.accessToken),
@@ -605,7 +700,7 @@ function registerIpc(): void {
       id: newSourceId(),
       kind: 'aliyun',
       name: (payload.name ?? '').trim() || drive.driveName || '阿里云盘',
-      config,
+      config: { ...config, scanScope: { mode: 'pending' } },
       enabled: true,
       lastScanAt: null,
       lastScanCount: 0,
@@ -632,27 +727,13 @@ function registerIpc(): void {
     return { opened: true };
   });
 
-  handle(IPC.pickExecutable, async () => {
-    const res = await dialog.showOpenDialog({
-      properties: ['openFile'],
-      title: '选择播放器可执行文件',
-      filters: process.platform === 'win32' ? [{ name: '可执行文件', extensions: ['exe'] }] : [],
-    });
-    return res.canceled ? null : (res.filePaths[0] ?? null);
-  });
-
-  handle(IPC.pickDirectory, async () => {
-    const res = await dialog.showOpenDialog({
-      properties: ['openDirectory', 'multiSelections'],
-      title: '选择媒体目录',
-    });
-    return res.canceled ? [] : res.filePaths;
-  });
+  handle(IPC.localPaths, (payload: { mode: LocalPathMode; path?: string }) =>
+    listLocalPaths(app.getPath('home'), payload.mode, payload.path));
 
   handle(IPC.sourcesList, () => repo.listSources());
 
-  handle(IPC.sourcesCreate, (payload: { kind: SourceKind; name: string; config: SourceConfig }) => {
-    const config = { ...payload.config } as SourceConfig;
+  handle(IPC.sourcesCreate, async (payload: { kind: SourceKind; name: string; config: SourceConfig }) => {
+    const config: SourceConfig = { ...payload.config, scanScope: { mode: 'pending' } };
     if (config.kind === 'webdav') config.password = encryptSecret(config.password);
     const source: StorageSource = {
       id: newSourceId(),
@@ -665,6 +746,10 @@ function registerIpc(): void {
       lastError: null,
       createdAt: Date.now(),
     };
+    if (config.kind === 'webdav') {
+      const result = await providerFor(source).test();
+      if (!result.ok) throw new Error(result.message);
+    }
     repo.insertSource(source);
     return source;
   });
@@ -672,6 +757,7 @@ function registerIpc(): void {
   handle(IPC.sourcesUpdate, (payload: { id: string; name?: string; config?: SourceConfig; enabled?: boolean }) => {
     const source = requireSource(payload.id);
     if (payload.config) {
+      aliyunProviders.delete(source.id);
       const config = { ...payload.config } as SourceConfig;
       // 已加密的密码原样保留，明文才重新加密
       if (config.kind === 'webdav' && !config.password.startsWith('enc:v1:') && !config.password.startsWith('obf:v1:')) {
@@ -686,6 +772,7 @@ function registerIpc(): void {
   });
 
   handle(IPC.sourcesRemove, (payload: { id: string }) => {
+    aliyunProviders.delete(payload.id);
     repo.deleteSource(payload.id);
     return { removed: payload.id };
   });
@@ -696,31 +783,30 @@ function registerIpc(): void {
     return provider.test();
   });
 
-  /**
-   * 浏览网盘目录：让用户在扫描前先看到盘里到底有什么。
-   * 之前只有「盲扫」，盘为空还是 id 不对都只能靠日志猜。
-   */
   handle(IPC.browseList, async (payload: { sourceId: string; parentId?: string }) => {
     const source = requireSource(payload.sourceId);
-    const provider = providerFor(source);
-    const parent = payload.parentId ?? '';
-    const entries = await provider.list(parent);
-    return {
-      parent: parent || String((source.config as { root?: unknown }).root ?? ''),
-      entries: entries.map((e) => ({
-        path: e.path,
-        name: e.name,
-        isDir: e.isDir,
-        size: e.size,
-        mtime: e.mtime,
-      })),
-    };
+    return listSourceDirectory(source, providerFor(source), payload.parentId);
+  });
+
+  handle(IPC.sourcesScanScope, async (payload: { sourceId: string; scope: ScanScope }) => {
+    if (scanning.has(payload.sourceId)) throw new Error('请先结束该源正在进行的扫描');
+    const source = requireSource(payload.sourceId);
+    const scope = await validateScanScope(source, providerFor(source), payload.scope);
+    if (scanning.has(payload.sourceId)) throw new Error('请先结束该源正在进行的扫描');
+    const current = requireSource(payload.sourceId);
+    if (current.config.kind !== source.config.kind || current.config.scanScope !== source.config.scanScope &&
+        JSON.stringify(current.config.scanScope) !== JSON.stringify(source.config.scanScope)) {
+      throw new Error('扫描范围已更改，请重新打开设置');
+    }
+    current.config = { ...current.config, scanScope: scope };
+    repo.updateSource(current);
+    return current;
   });
 
   handle(IPC.scanStart, async (payload: { sourceId?: string }) => {
     const targets = payload.sourceId
       ? [payload.sourceId]
-      : repo.listSources().filter((s) => s.enabled).map((s) => s.id);
+      : repo.listSources().filter((s) => s.enabled && s.config.scanScope?.mode !== 'pending').map((s) => s.id);
     const summaries: ScanSummary[] = [];
     for (const id of targets) {
       summaries.push(await runScan(id));
@@ -740,6 +826,12 @@ function registerIpc(): void {
   handle(IPC.librarySections, () => repo.sectionCounts());
   handle(IPC.libraryContinue, (payload: { limit?: number }) => repo.continueWatching(payload?.limit ?? 12));
   handle(IPC.libraryItem, (payload: { id: string }) => repo.getItem(payload.id));
+  handle(IPC.libraryArtwork, (payload: { id: string }) => libraryArtwork(payload.id));
+  handle(IPC.libraryGenresUpdate, (payload: { workKey: string; genres: Genre[] | null }) => {
+    if (payload.genres !== null && !Array.isArray(payload.genres)) throw new Error('题材格式无效');
+    repo.updateWorkGenres(payload.workKey, payload.genres);
+    return { saved: true };
+  });
 
   handle(IPC.playItem, (payload: { itemId: string }) => handlePlay(payload.itemId));
 
@@ -828,8 +920,8 @@ if (!app.requestSingleInstanceLock()) {
 
   void app.whenReady().then(bootstrap).catch((err) => {
     log('[nebula] 启动失败', err);
-    dialog.showErrorBox('启动失败', err instanceof Error ? err.message : String(err));
-    app.quit();
+    startupError = err instanceof Error ? err.message : String(err);
+    createWindow();
   });
 
   app.on('activate', () => {

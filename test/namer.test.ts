@@ -113,11 +113,18 @@ test('无年份纯标题：电影且置信度偏低', () => {
   assert.ok(r.confidence < 0.8, `confidence=${r.confidence}`);
 });
 
-test('剧集 seriesKey 只由剧名与年份决定，与集号无关', () => {
+test('同一部剧的聚合键与季集号无关', () => {
   const a = parseMediaFile({ fullPath: 'x/Breaking.Bad.S01E01.mkv', fileName: 'Breaking.Bad.S01E01.mkv' });
   const b = parseMediaFile({ fullPath: 'x/Breaking.Bad.S03E07.1080p.mkv', fileName: 'Breaking.Bad.S03E07.1080p.mkv' });
   assert.equal(a.seriesKey, b.seriesKey);
   assert.notEqual(a.seriesKey, null);
+});
+
+test('明确标注首播年份的目录可区分同名翻拍', () => {
+  const a = parseMediaFile({ fullPath: '剧集/同名剧 (2000)/Season 1/01.mp4', fileName: '01.mp4' });
+  const b = parseMediaFile({ fullPath: '剧集/同名剧 (2020)/Season 1/01.mp4', fileName: '01.mp4' });
+  assert.equal(a.title, b.title);
+  assert.notEqual(a.seriesKey, b.seriesKey);
 });
 
 test('x264 / h264 / avc 归一化为同一编码标识，便于筛选', () => {

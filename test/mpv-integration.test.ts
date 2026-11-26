@@ -4,6 +4,7 @@ import { existsSync, copyFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { MpvController } from '../src/main/player/mpv';
+import { captureFirstVisibleFrame } from '../src/main/player/cover';
 
 /**
  * 真实 mpv 集成测试：不 mock IPC、不 mock 进程。
@@ -22,6 +23,16 @@ const SAMPLES = [
 function findSample(): string | null {
   return SAMPLES.find((p) => existsSync(p)) ?? null;
 }
+
+test('真实 mpv：跳过片头黑屏并截取第一张有画面的帧', async (t) => {
+  if (!existsSync(MPV)) return t.skip('缺少 mpv');
+  const red = 'av://lavfi:color=c=red:s=64x64:r=1:d=1';
+  const clip = 'av://lavfi:color=c=black:s=64x64:r=1:d=1[a];color=c=red:s=64x64:r=1:d=1[b];color=c=blue:s=64x64:r=1:d=1[c];[a][b][c]concat=n=3:v=1:a=0';
+  const expected = await captureFirstVisibleFrame(MPV, { url: red, headers: {} });
+  const artwork = await captureFirstVisibleFrame(MPV, { url: clip, headers: {} });
+  assert.ok(expected?.startsWith('data:image/jpeg;base64,/9j/'));
+  assert.equal(artwork, expected);
+});
 
 async function waitFor<T>(fn: () => T | null, timeoutMs: number, label: string): Promise<T> {
   const deadline = Date.now() + timeoutMs;

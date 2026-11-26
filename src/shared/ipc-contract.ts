@@ -5,8 +5,7 @@ export const IPC = {
   settingsGet: 'settings:get',
   settingsUpdate: 'settings:update',
   mpvLocate: 'mpv:locate',
-  pickDirectory: 'app:pick-directory',
-  pickExecutable: 'app:pick-executable',
+  localPaths: 'app:local-paths',
 
   playersDetect: 'players:detect',
   playersTest: 'players:test',
@@ -22,6 +21,7 @@ export const IPC = {
   sourcesList: 'sources:list',
   sourcesCreate: 'sources:create',
   sourcesUpdate: 'sources:update',
+  sourcesScanScope: 'sources:scan-scope',
   sourcesRemove: 'sources:remove',
   sourcesTest: 'sources:test',
 
@@ -33,6 +33,8 @@ export const IPC = {
   librarySections: 'library:sections',
   libraryContinue: 'library:continue',
   libraryItem: 'library:item',
+  libraryArtwork: 'library:artwork',
+  libraryGenresUpdate: 'library:genres-update',
 
   playItem: 'play:item',
   playCommand: 'play:command',
@@ -44,3 +46,10 @@ export const IPC = {
 } as const;
 
 export type Rpc<T> = { ok: true; data: T } | { ok: false; error: string };
+
+export type LocalPathMode = 'directory' | 'executable';
+export interface LocalPathListing {
+  path: string;
+  parent: string;
+  entries: Array<{ name: string; path: string; directory: boolean }>;
+}

@@ -1,5 +1,6 @@
 import QRCode from 'qrcode';
 import { log } from '../logger';
+import { ProviderError } from './types';
 
 /**
  * 阿里云盘扫码授权。
@@ -24,7 +25,8 @@ const UA =
 
 const PASSPORT = 'https://passport.aliyundrive.com/newlogin/qrcode';
 const TOKEN_URL = 'https://auth.aliyundrive.com/v2/account/token';
-const OPENAPI = 'https://openapi.alipan.com';
+const USER_API = 'https://user.aliyundrive.com';
+const LEGACY_API = 'https://api.aliyundrive.com';
 
 export const ALIYUN_QR_APP_PARAMS =
   'appName=aliyun_drive&fromSite=52&appEntrance=web&isMobile=false&lang=zh_CN&_bx-v=2.5.3';
@@ -69,12 +71,15 @@ function baseHeaders(): Record<string, string> {
   };
 }
 
-async function getJson(url: string, init?: RequestInit): Promise<unknown> {
+async function getJson(url: string, init?: RequestInit, requireOk = false): Promise<unknown> {
   const res = await fetch(url, {
     ...init,
     headers: { ...baseHeaders(), ...(init?.headers as Record<string, string> | undefined) },
     signal: AbortSignal.timeout(20000),
   });
+  if (requireOk && !res.ok) {
+    throw new ProviderError(`阿里云盘账号接口返回 HTTP ${res.status}`, res.status);
+  }
   const text = await res.text();
   try {
     return JSON.parse(text) as unknown;
@@ -279,84 +284,38 @@ export interface DriveInfo {
 }
 
 /**
- * 取默认网盘信息。
- *
- * 必须用 Web 端 API（api.aliyundrive.com），不能用开放平台（openapi.alipan.com）：
- * passport 扫码与 refresh_token 换出来的都是 Web 会话 token，开放平台接口会回
- * TokenVerifyFailed: invalid access_token（实测，已由日志确认）。
+ * 网页版从 user 域名读取账号资料，其中包含资源库和备份盘 ID。
+ * 旧 api 域名的同名接口通常只给出默认盘。
  */
 export async function getDriveInfo(accessToken: string): Promise<DriveInfo> {
-  const json = (await getJson('https://api.aliyundrive.com/v2/user/get', {
+  const request = {
     method: 'POST',
     headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
     body: '{}',
-  })) as Record<string, unknown>;
-
-  // 诊断：只记键名不记值。用来确认 v2/user/get 到底提供了哪几个 drive id，
-  // 以及资源库字段的真实名字（不同版本叫 resource_drive_id / resourceDriveId 等）。
-  log('[aliyun] v2/user/get 顶层键:', Object.keys(json).join(',') || '(空)');
-  // path_status / default_location 指示资源库是否启用与默认位置——根目录返回 0 项时，
-  // 这两项是判断「盘为空」还是「盘未启用」的关键。它们不含隐私数据，直接记值。
-  log(
-    '[aliyun] 账号状态: path_status =',
-    String(json['path_status'] ?? '(无)'),
-    '| default_location =',
-    String(json['default_location'] ?? '(无)'),
-    '| role =',
-    String(json['role'] ?? '(无)'),
-  );
-
-  const driveId =
-    (typeof json['default_drive_id'] === 'string' && json['default_drive_id']) ||
-    (typeof json['resource_drive_id'] === 'string' && json['resource_drive_id']) ||
-    (typeof json['backup_drive_id'] === 'string' && json['backup_drive_id']) ||
-    '';
-  if (!driveId) {
-    throw new Error(`无法获取阿里云盘 drive_id：${JSON.stringify(json).slice(0, 240)}`);
-  }
-
-  const toNum = (v: unknown): number => (typeof v === 'number' ? v : Number.isFinite(Number(v)) ? Number(v) : 0);
-  const space = (json['space_info'] ?? {}) as Record<string, unknown>;
-
-  // 阿里云盘一个账号可能有多个 drive：default（默认盘）、resource（资源库）、backup（备份盘）。
-  // 用户媒体常在资源库，而 default_drive_id 往往指向备份盘——
-  // 只用一个 id 会出现「登录成功但 list 返回 0 项」。这里全部收集，供上层逐个尝试。
-  const allDriveIds: string[] = [];
-  for (const key of ['resource_drive_id', 'default_drive_id', 'backup_drive_id', 'drive_id']) {
-    const v = json[key];
-    if (typeof v === 'string' && v && !allDriveIds.includes(v)) allDriveIds.push(v);
-  }
-  if (!allDriveIds.includes(driveId)) allDriveIds.unshift(driveId);
-
-  // 实测：v2/user/get 的 default_drive_id 与网页版实际使用的 drive_id 不是同一个
-  // （用户账号：API 给 2624585230，网页端请求里是 1304585230），
-  // 导致 root 合法但 list 恒返回 0 项。这里额外问一次 get_default_drive，
-  // 把它的结果排在最前优先尝试。
-  try {
-    const d = (await getJson('https://api.aliyundrive.com/v2/drive/get_default_drive', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-      body: '{}',
-    })) as Record<string, unknown>;
-    const preferred = String(d['drive_id'] ?? d['default_drive_id'] ?? '');
-    if (preferred) {
-      log('[aliyun] v2/drive/get_default_drive →', preferred);
-      if (!allDriveIds.includes(preferred)) allDriveIds.unshift(preferred);
-      else allDriveIds.sort((a, b) => (a === preferred ? -1 : b === preferred ? 1 : 0));
-    }
-  } catch (err) {
-    log('[aliyun] v2/drive/get_default_drive 失败:', err instanceof Error ? err.message.slice(0, 120) : String(err));
-  }
-  log('[aliyun] 候选 drive_id 顺序:', allDriveIds.join(' → '));
-
-  return {
-    driveId,
-    driveName:
-      (typeof json['nick_name'] === 'string' && json['nick_name']) ||
-      (typeof json['user_name'] === 'string' && json['user_name']) ||
-      '阿里云盘',
-    usedSize: toNum(space['used_size']),
-    totalSize: toNum(space['total_size']),
-    allDriveIds,
   };
+  for (const base of [USER_API, LEGACY_API]) {
+    try {
+      const json = (await getJson(`${base}/v2/user/get`, request, true)) as Record<string, unknown> | null;
+      const ids = ['resource_drive_id', 'backup_drive_id', 'default_drive_id', 'drive_id']
+        .map((key) => json?.[key])
+        .filter((id): id is string => typeof id === 'string' && id.length > 0);
+      const allDriveIds = [...new Set(ids)];
+      const driveId = allDriveIds[0];
+      if (!driveId) continue;
+
+      const name = json?.['display_name'] || json?.['nick_name'] || json?.['user_name'];
+      const space = json?.['space_info'] as Record<string, unknown> | undefined;
+      return {
+        driveId,
+        driveName: typeof name === 'string' && name ? name : '阿里云盘',
+        usedSize: Number(space?.['used_size']) || 0,
+        totalSize: Number(space?.['total_size']) || 0,
+        allDriveIds,
+      };
+    } catch (err) {
+      if (err instanceof ProviderError && err.status === 401) throw err;
+      log('[aliyun] 获取账号网盘失败', new URL(base).host, err instanceof Error ? err.name : String(err));
+    }
+  }
+  throw new Error('无法读取阿里云盘的盘列表，请检查连接或重新扫码授权');
 }

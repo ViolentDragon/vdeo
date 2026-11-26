@@ -3,8 +3,13 @@
  * 变更本文件时同步检查 src/main/db 与 src/renderer 的消费方。
  */
 
+import type { BridgedDriveId } from './drives';
+
 /** 媒体库分区（Emby/Jellyfin 式归类结果） */
 export type LibrarySection = 'movie' | 'tv' | 'anime' | 'music' | 'photo' | 'other';
+
+export const GENRES = ['剧情', '古装', '武侠', '悬疑', '犯罪', '喜剧', '爱情', '动作', '科幻', '奇幻', '恐怖', '战争', '历史', '动画', '纪录片', '综艺'] as const;
+export type Genre = (typeof GENRES)[number];
 
 export const SECTION_LABEL: Record<LibrarySection, string> = {
   movie: '电影',
@@ -33,6 +38,7 @@ export interface LocalSourceConfig {
 
 export interface WebdavSourceConfig {
   kind: 'webdav';
+  driveBrand?: BridgedDriveId;
   /** 例：https://dav.jianguoyun.com/dav （Alist/OpenList 也以此协议暴露） */
   url: string;
   username: string;
@@ -63,11 +69,19 @@ export interface BaiduSourceConfig {
   root: string;
 }
 
-export type SourceConfig =
-  | LocalSourceConfig
-  | WebdavSourceConfig
-  | AliyunSourceConfig
-  | BaiduSourceConfig;
+export interface ScanFolderRef {
+  path: string;
+  name: string;
+}
+
+export type ScanScope =
+  | { mode: 'pending' }
+  | { mode: 'all' }
+  | { mode: 'custom'; folders: ScanFolderRef[][] };
+
+export type SourceConfig = (LocalSourceConfig | WebdavSourceConfig | AliyunSourceConfig | BaiduSourceConfig) & {
+  scanScope?: ScanScope;
+};
 
 export interface StorageSource {
   id: string;
@@ -103,6 +117,7 @@ export interface MediaItem {
   /** 剧集聚合键（movie 为 null） */
   seriesKey: string | null;
   seriesTitle: string | null;
+  genres?: Genre[];
 
   /** 技术标签：2160p / 1080p / WEB-DL / BluRay / HEVC / DDP5.1 … */
   resolution: string | null;
@@ -116,6 +131,7 @@ export interface MediaItem {
 
   /** 元数据与本地缓存的图片路径 */
   poster: string | null;
+  posterItemId?: string | null;
   backdrop: string | null;
   overview: string | null;
   rating: number | null;
@@ -140,6 +156,9 @@ export interface SeriesSummary {
   seasonCount: number;
   seasons: number[];
   poster: string | null;
+  posterItemId: string | null;
+  artworkId: string;
+  genres: Genre[];
   latestAddedAt: number;
   /** 已看到的最新集（用于"继续观看"提示） */
   lastWatchedEpisode: number | null;
@@ -156,7 +175,8 @@ export interface BrowseQuery {
   offset?: number;
   limit?: number;
   /** item=按文件；series=按剧集聚合卡片 */
-  group?: 'item' | 'series';
+  group?: 'item' | 'series' | 'catalog';
+  genre?: Genre | 'untagged';
   /** 只看最近添加 */
   recentOnly?: boolean;
 }
@@ -165,7 +185,10 @@ export interface BrowseResult {
   total: number;
   items: MediaItem[];
   series: SeriesSummary[];
+  entries?: CatalogEntry[];
 }
+
+export type CatalogEntry = { workKey?: string } & ({ kind: 'series'; series: SeriesSummary } | { kind: 'item'; item: MediaItem });
 
 /* ------------------------------ 播放 ------------------------------ */
 

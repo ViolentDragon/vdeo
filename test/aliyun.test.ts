@@ -1,12 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { deepFindString, listBizExtKeys, parseBizExt } from '../src/main/sources/aliyun-auth';
-
-/**
- * 只测纯解析逻辑（不联网）。
- * 扫码接口的可达性用真实探针验证过（generate/query/auth-token/openapi 四个端点均存在），
- * 真实扫码确认那一步需要用户手机，无法自动化。
- */
+import { AliyunProvider } from '../src/main/sources/aliyun';
+import { createRepository } from '../src/main/db';
+import { scanSource } from '../src/main/scan/scanner';
+import type { StorageSource } from '../src/shared/types';
 
 function b64(obj: unknown): string {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64');
@@ -84,4 +82,103 @@ test('listBizExtKeys：只输出字段名，不泄漏字段值', () => {
 test('listBizExtKeys：非法输入返回空数组而不抛异常', () => {
   assert.deepEqual(listBizExtKeys(null), []);
   assert.deepEqual(listBizExtKeys('not-base64!!'), []);
+});
+
+test('已有阿里云盘源发现资源库，递归扫描和播放使用文件所在的盘', async ({ mock }) => {
+  const config = {
+    kind: 'aliyun' as const,
+    driveId: 'backup',
+    root: 'root',
+    accessToken: 'access',
+    refreshToken: 'refresh',
+    expiresAt: 0,
+    userName: null,
+  };
+  const source: StorageSource = {
+    id: 'aliyun-test',
+    kind: config.kind,
+    name: '阿里云盘',
+    enabled: true,
+    config,
+    lastScanAt: null,
+    lastScanCount: 0,
+    lastError: null,
+    createdAt: 0,
+  };
+  const token = { ...config, userId: null };
+  let failResourceFolder = false;
+  let emptyResourceFolder = false;
+  mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+    if (url === 'https://user.aliyundrive.com/v2/user/get') {
+      return Response.json({ resource_drive_id: 'resource', backup_drive_id: 'backup', default_drive_id: 'backup' });
+    }
+    const body = JSON.parse(String(init.body));
+    if (url === 'https://api.aliyundrive.com/v2/file/get_download_url') {
+      assert.equal(body.drive_id, 'resource');
+      assert.equal(body.file_id, 'movie');
+      return Response.json({ url: 'https://example.test/movie.mkv' });
+    }
+    assert.equal(url, 'https://api.aliyundrive.com/adrive/v3/file/list');
+    if (body.parent_file_id === 'root') {
+      if (body.drive_id === 'resource') {
+        return Response.json({ items: [{ file_id: 'folder', name: '电影', type: 'folder' }] });
+      }
+      assert.equal(body.drive_id, 'backup');
+      return Response.json({ items: [{ file_id: 'cover', name: '封面.jpg', type: 'file' }] });
+    }
+    assert.equal(body.drive_id, 'resource');
+    assert.equal(body.parent_file_id, 'folder');
+    if (failResourceFolder) return Response.json({}, { status: 503 });
+    if (emptyResourceFolder || body.marker === 'next') return Response.json({ items: [] });
+    return Response.json({ items: [{ file_id: 'movie', name: 'Movie.mkv', type: 'file' }], next_marker: 'next' });
+  });
+
+  const provider = new AliyunProvider(config, token);
+  const root = await provider.list('');
+  assert.deepEqual(root.map((entry) => [entry.path, entry.isDir]), [['resource:folder', true], ['cover', false]]);
+  const nested = await new AliyunProvider(config, token).list('resource:folder');
+  assert.equal(nested[0]?.path, 'resource:movie');
+  assert.equal((await provider.resolvePlayUrl('resource:movie')).url, 'https://example.test/movie.mkv');
+
+  const repo = createRepository(':memory:');
+  try {
+    repo.insertSource(source);
+    const scan = () => scanSource({ source, provider, repo, ignorePatterns: [] });
+    const summary = await scan();
+    assert.equal(summary.error, null);
+    assert.equal(summary.found, 2);
+    assert.equal(repo.countItems(), 2);
+    assert.equal((await scan()).added, 0);
+
+    failResourceFolder = true;
+    assert.match((await scan()).error ?? '', /503/);
+    assert.equal(repo.countItems(), 2);
+
+    failResourceFolder = false;
+    emptyResourceFolder = true;
+    assert.equal((await scan()).error, null);
+    assert.equal(repo.countItems(), 1);
+  } finally {
+    repo.close();
+  }
+});
+
+test('阿里云盘原画或高清地址为空时仍能播放可用转码', async ({ mock }) => {
+  const config = { kind: 'aliyun' as const, driveId: 'drive', root: 'root', accessToken: 'a', refreshToken: 'r', expiresAt: 0, userName: null };
+  mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    assert.equal(body.file_id, 'movie');
+    if (url.endsWith('/get_download_url')) return Response.json({ url: '', cdn_url: '' });
+    if (body.category === 'live_transcoding') return Response.json({ video_preview_play_info: { live_transcoding_task_list: [{ template_id: 'FHD', status: 'finished', url: '' }] } });
+    assert.equal(body.category, 'quick_video');
+    return Response.json({ video_preview_play_info: { quick_video_list: [
+      { template_id: 'SD', status: 'finished', url: 'https://example.test/sd.m3u8' },
+      { template_id: 'HD', status: 'finished', url: 'https://example.test/hd.m3u8' },
+      { template_id: 'FHD', status: 'finished', url: 'https://example.test/{segment}' },
+    ] } });
+  });
+  const provider = new AliyunProvider(config, { ...config, userId: null });
+  const media = await provider.resolvePlayUrl('movie');
+  assert.equal(media.url, 'https://example.test/hd.m3u8');
+  assert.equal(media.headers['Authorization'], undefined);
 });

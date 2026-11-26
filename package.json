@@ -1,7 +1,7 @@
 {
   "name": "nebula-media",
   "productName": "Nebula",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "星云影库 — 桌面媒体库与播放器，支持网盘挂载、自动归类、内嵌 mpv 播放",
   "main": "dist/main/index.js",
   "private": true,
@@ -19,7 +19,8 @@
     "pack:dir": "npm run build && node scripts/vendor-mpv.mjs && electron-builder --win --x64 --dir",
     "pack": "npm run build && node scripts/vendor-mpv.mjs && electron-builder --win --x64",
     "deploy": "node scripts/deploy-desktop.mjs --shortcut",
-    "pack:deploy": "npm run pack && node scripts/deploy-desktop.mjs --shortcut"
+    "pack:deploy": "npm run pack && node scripts/deploy-desktop.mjs --shortcut",
+    "update": "node scripts/update-release.mjs"
   },
   "build": {
     "appId": "com.nebula.mediaplayer",

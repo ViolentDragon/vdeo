@@ -1,7 +1,8 @@
-import { parseMediaFile, VIDEO_EXTS, AUDIO_EXTS, IMAGE_EXTS, SUBTITLE_EXTS } from './namer';
+import { parseMediaFile, seriesFolderTitle, VIDEO_EXTS, AUDIO_EXTS, IMAGE_EXTS, SUBTITLE_EXTS } from './namer';
 import type { RemoteEntry, StorageProvider } from '../sources/types';
 import type { Repository } from '../db/index';
-import { itemId } from '../db/ids';
+import { itemId, seriesKey } from '../db/ids';
+import { sourceScanRoots } from './scope';
 import type { LibrarySection, MediaItem, ScanProgress, ScanSummary, StorageSource } from '../../shared/types';
 
 const SYSTEM_DIRS =
@@ -11,6 +12,9 @@ const SYSTEM_DIRS =
 const DEFAULT_MAX_ENTRIES = 400_000;
 const DEFAULT_MAX_DEPTH = 12;
 const CONCURRENCY = 4;
+const POSTER_FORMATS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp']);
+const POSTER_NAMES = ['poster', '宣传海报', '劇集海報', '剧集海报', '海报', '海報', '剧卡', '劇卡', 'cover', '封面', 'folder'];
+type ArtworkFolder = { name: string; images: RemoteEntry[] };
 
 export interface ScanOptions {
   source: StorageSource;
@@ -41,10 +45,28 @@ function ignored(name: string, patterns: string[]): boolean {
   return patterns.some((p) => p && name.toLowerCase().includes(p.toLowerCase()));
 }
 
+function findPoster(sourceId: string, title: string, folders: ArtworkFolder[]): string | null {
+  const key = seriesKey(title, null);
+  const named = new Set([key, ...POSTER_NAMES.map((name) => seriesKey(`${title} ${name}`, null))]);
+  for (const folder of folders) {
+    const hits = new Map(folder.images.map((image) => [
+      seriesKey(seriesFolderTitle(image.name.slice(0, image.name.lastIndexOf('.'))), null), image.path,
+    ]));
+    const explicit = [...named].map((name) => hits.get(name)).find(Boolean);
+    if (explicit) return itemId(sourceId, explicit);
+    const folderTitle = seriesFolderTitle(folder.name);
+    if (!folder.name || (folderTitle && seriesKey(folderTitle, null) !== key)) continue;
+    const generic = POSTER_NAMES.map((name) => hits.get(seriesKey(name, null))).find(Boolean);
+    if (generic) return itemId(sourceId, generic);
+  }
+  return null;
+}
+
 function makeItem(
   sourceId: string,
   entry: RemoteEntry,
-  sectionHint: LibrarySection,
+  displayPath: string,
+  artwork: ArtworkFolder[],
   now: number,
 ): MediaItem | null {
   const ext = extOf(entry.name);
@@ -52,7 +74,7 @@ function makeItem(
   if (!section) return null;
 
   if (section === 'movie') {
-    const parsed = parseMediaFile({ fullPath: entry.path, fileName: entry.name });
+    const parsed = parseMediaFile({ fullPath: displayPath, fileName: entry.name });
     return {
       id: itemId(sourceId, entry.path),
       sourceId,
@@ -69,6 +91,7 @@ function makeItem(
       episodeEnd: parsed.episodeEnd,
       seriesKey: parsed.seriesKey,
       seriesTitle: parsed.seriesTitle,
+      genres: parsed.genres,
       resolution: parsed.resolution,
       quality: parsed.quality,
       videoCodec: parsed.videoCodec,
@@ -76,6 +99,7 @@ function makeItem(
       releaseGroup: parsed.releaseGroup,
       confidence: parsed.confidence,
       poster: null,
+      posterItemId: parsed.seriesTitle ? findPoster(sourceId, parsed.seriesTitle, artwork) : null,
       backdrop: null,
       overview: null,
       rating: null,
@@ -134,7 +158,7 @@ export async function scanSource(opts: ScanOptions): Promise<ScanSummary> {
   const maxEntries = opts.maxEntries ?? DEFAULT_MAX_ENTRIES;
   const maxDepth = opts.maxDepth ?? DEFAULT_MAX_DEPTH;
 
-  const roots = source.config.kind === 'local' ? source.config.roots : [source.config.root || '/'];
+  const roots = sourceScanRoots(source);
 
   const progress: ScanProgress = {
     sourceId: source.id,
@@ -161,9 +185,13 @@ export async function scanSource(opts: ScanOptions): Promise<ScanSummary> {
   };
 
   emit({ phase: 'listing' });
-  repo.beginScan(source.id);
+  // 阿里云盘的目录读取可能在扫描中途失败，完整遍历后再标记消失的媒体。
+  const preserveOnFailure = source.config.kind === 'aliyun' || source.config.scanScope?.mode === 'custom';
+  const seenItemIds = preserveOnFailure ? new Set<string>() : null;
+  if (!seenItemIds) repo.beginScan(source.id);
 
-  const queue: Array<{ path: string; depth: number }> = roots.map((r) => ({ path: r, depth: 0 }));
+  const queue = roots.map((root) => ({ ...root, depth: 0, artwork: [] as ArtworkFolder[] }));
+  const scheduled = new Set(roots.map((root) => root.path));
   const batch: MediaItem[] = [];
   const now = Date.now();
   let found = 0;
@@ -171,6 +199,7 @@ export async function scanSource(opts: ScanOptions): Promise<ScanSummary> {
   let added = 0;
   let updated = 0;
   let error: string | null = null;
+  let listingError: string | null = null;
 
   const flush = () => {
     if (batch.length === 0) return;
@@ -191,16 +220,20 @@ export async function scanSource(opts: ScanOptions): Promise<ScanSummary> {
             return { dir, entries: await provider.list(dir.path) };
           } catch (err) {
             // 单个子目录失败不应中断整源扫描；记录下来继续
-            emit({
-              message: `跳过 ${dir.path}：${err instanceof Error ? err.message : String(err)}`,
-            });
+            const message = `跳过 ${dir.path}：${err instanceof Error ? err.message : String(err)}`;
+            listingError ??= message;
+            emit({ message });
             return { dir, entries: [] as RemoteEntry[] };
           }
         }),
       );
+      check();
 
       for (const { dir, entries } of listings) {
         emit({ currentPath: dir.path });
+        const images = entries.filter((entry) => !entry.isDir && POSTER_FORMATS.has(extOf(entry.name)) && !ignored(entry.name, ignorePatterns));
+        const folderName = dir.displayPath.split(/[\\/]/).filter(Boolean).at(-1) ?? '';
+        const artwork = images.length ? [...dir.artwork, { name: folderName, images }] : dir.artwork;
         for (const entry of entries) {
           scanned += 1;
           if (scanned > maxEntries) {
@@ -209,18 +242,23 @@ export async function scanSource(opts: ScanOptions): Promise<ScanSummary> {
           }
           const name = entry.name || entry.path.split('/').pop() || '';
           if (ignored(name, ignorePatterns)) continue;
+          const displayPath = `${dir.displayPath}/${name}`;
 
           if (entry.isDir) {
-            if (dir.depth + 1 <= maxDepth) queue.push({ path: entry.path, depth: dir.depth + 1 });
+            if (dir.depth < maxDepth && !scheduled.has(entry.path)) {
+              scheduled.add(entry.path);
+              queue.push({ path: entry.path, depth: dir.depth + 1, displayPath, artwork });
+            }
             continue;
           }
 
           const ext = extOf(name);
           if (SUBTITLE_EXTS.has(ext)) continue;
 
-          const item = makeItem(source.id, entry, 'movie', now);
+          const item = makeItem(source.id, entry, displayPath, artwork, now);
           if (item) {
             found += 1;
+            seenItemIds?.add(item.id);
             batch.push(item);
             if (batch.length >= 200) {
               emit({ phase: 'saving', found, scanned });
@@ -234,7 +272,9 @@ export async function scanSource(opts: ScanOptions): Promise<ScanSummary> {
     }
 
     emit({ phase: 'saving', found, scanned });
+    if (seenItemIds && listingError) throw new Error(listingError);
     flush();
+    if (seenItemIds) repo.finishScan(source.id, seenItemIds);
     emit({ phase: 'done', finishedAt: Date.now(), found, scanned, message: null });
   } catch (err) {
     flush();

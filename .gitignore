@@ -6,3 +6,6 @@ dist/
 Thumbs.db
 release/
 vendor/
+.env
+.env.*
+!.env.example

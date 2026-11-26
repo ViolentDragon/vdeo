@@ -1,4 +1,5 @@
 import { seriesKey as makeSeriesKey } from '../db/ids';
+import type { Genre } from '../../shared/types';
 
 export interface ParseInput {
   /** 完整路径（含目录），用于季号与标题回退 */
@@ -16,6 +17,7 @@ export interface ParsedMedia {
   episodeEnd: number | null;
   seriesKey: string | null;
   seriesTitle: string | null;
+  genres: Genre[];
   resolution: string | null;
   quality: string | null;
   videoCodec: string | null;
@@ -89,13 +91,50 @@ const NOISE_RULES: RegExp[] = [
   /\b(60fps|50fps|hq|multi|chs|cht|eng|jpn|kor|双语|中字|简中|繁中|内嵌|外挂)\b/i,
 ];
 
-const SEASON_DIR_RES = [
-  /season\s*(\d{1,2})/i,
-  /第\s*(\d{1,2})\s*季/,
-  /(?:^|[\\/])s(\d{1,2})(?:[\\/]|$)/i,
-];
-
 const ANIME_PATH_HINTS = /(动漫|动画|番剧|新番|anime|bangumi|cartoon)/i;
+const CN_NUMBER = '[0-9〇零一二两兩三四五六七八九十百千]';
+const SEASON_MARKER = new RegExp(`(?:第\\s*(${CN_NUMBER}{1,5})\\s*[季部]|(?:^|[\\s._-])(?:season\\s*|s)(\\d{1,2})(?!\\d)|((?:续|續)[集篇]))`, 'i');
+const GENRE_RULES: Array<[Genre, RegExp]> = [
+  ['剧情', /剧情|劇情|\bdrama\b/i], ['古装', /古装|古裝|宫廷|宮廷|宫斗|宮鬥|权谋|權謀/i],
+  ['武侠', /武侠|武俠|江湖|\bwuxia\b/i], ['悬疑', /悬疑|懸疑|推理|惊悚|驚悚|\b(mystery|thriller)\b/i],
+  ['犯罪', /犯罪|刑侦|刑偵|警匪|\bcrime\b/i], ['喜剧', /喜剧|喜劇|搞笑|\bcomedy\b/i],
+  ['爱情', /爱情|愛情|恋爱|戀愛|言情|\bromance\b/i], ['动作', /动作片|動作片|[/\\\[【（(]动作(?=[/\\\]】）)])|\baction\b/i],
+  ['科幻', /科幻|\bsci[- ]?fi\b|science fiction/i], ['奇幻', /奇幻|玄幻|魔幻|仙侠|仙俠|\bfantasy\b/i],
+  ['恐怖', /恐怖|\bhorror\b/i], ['战争', /战争|戰爭|抗战|抗戰|\bwar\b/i],
+  ['历史', /历史|歷史|史诗|史詩|\bhistorical\b/i], ['动画', ANIME_PATH_HINTS],
+  ['纪录片', /纪录片|紀錄片|纪实|紀實|\bdocumentar(?:y|ies)\b/i], ['综艺', /综艺|綜藝|真人秀|\breality show\b/i],
+];
+const GENERIC_FOLDER = /^(?:tv|series|movies?|films?|videos?|media|剧集|电视剧|電視劇|电视剧资源|电影|電影|视频资源|視頻資源|动漫|动画|番剧|综艺|纪录片|国产剧|国剧|陆剧|港剧|美剧|日剧|韩剧|下载|资源库|合集)$/i;
+const YEAR_PATTERN = /(?:^|[^\d])((?:19|20)\d{2})(?:[^\d]|$)/;
+
+function mediaNumber(text: string): number {
+  if (/^\d+$/.test(text)) return Number(text);
+  const digits = '零一二三四五六七八九';
+  const units: Record<string, number> = { 十: 10, 百: 100, 千: 1000 };
+  let total = 0;
+  let digit = 0;
+  for (const char of text.replace(/[两兩]/g, '二').replace(/〇/g, '零')) {
+    const unit = units[char];
+    if (unit) {
+      total += (digit || 1) * unit;
+      digit = 0;
+    } else {
+      digit = digit * 10 + Math.max(0, digits.indexOf(char));
+    }
+  }
+  return total + digit;
+}
+
+function seasonFromTitle(raw: string): { title: string; season: number | null } {
+  const match = raw.match(SEASON_MARKER);
+  if (!match || match.index === undefined) return { title: cleanTitle(raw), season: null };
+  const before = cleanTitle(raw.slice(0, match.index));
+  return { title: before, season: match[3] ? 2 : mediaNumber(match[1] ?? match[2] ?? '') };
+}
+
+export function seriesFolderTitle(name: string): string {
+  return seasonFromTitle(name).title;
+}
 
 function stripExtension(name: string): string {
   const idx = name.lastIndexOf('.');
@@ -133,21 +172,11 @@ function titleFromDirs(fullPath: string): { title: string; season: number | null
   let season: number | null = null;
   for (let i = segs.length - 1; i >= 0; i -= 1) {
     const seg = segs[i]!;
-    // 注意：判据必须是「本段是不是季目录」，不能用全局 season 是否已找到——
-    // 否则一旦识别到季号，所有上层目录都会被当成季目录跳过，剧名就丢了。
-    let isSeasonDir = false;
-    for (const re of SEASON_DIR_RES) {
-      const m = seg.match(re);
-      if (m && m[1]) {
-        season = Number(m[1]);
-        isSeasonDir = true;
-        break;
-      }
-    }
-    if (isSeasonDir) continue;
-    if (/^(season|s\d+)$/i.test(seg)) continue;
-    if (/^\d+$/.test(seg)) continue;
-    return { title: cleanTitle(seg), season };
+    const parsed = seasonFromTitle(seg);
+    season ??= parsed.season;
+    const title = parsed.title.replace(/^[\s\-–—]+/, '');
+    if (!title || GENERIC_FOLDER.test(title) || /^\d+$/.test(title) || GENRE_RULES.some(([genre]) => genre === title)) continue;
+    return { title, season };
   }
   return { title: '', season };
 }
@@ -158,21 +187,19 @@ type EpisodeHit = {
   episodeEnd: number | null;
   index: number;
   length: number;
-  major?: boolean;
 };
 
 function findEpisode(text: string, allowAnimeDash: boolean): EpisodeHit | null {
   // S01E02 / S01E02E03 / S01E02-E04
-  const sxxexx = text.match(/s(\d{1,2})e(\d{1,4})(?:-?e(\d{1,4})|e(\d{1,4}))?/i);
+  const sxxexx = text.match(/s(\d{1,2})[ ._-]*e(\d{1,4})(?!\d)(?:[ ._-]*e(\d{1,4})(?!\d))?/i);
   if (sxxexx?.index !== undefined) {
-    const endRaw = sxxexx[3] ?? sxxexx[4] ?? null;
+    const endRaw = sxxexx[3];
     return {
       season: Number(sxxexx[1]),
       episode: Number(sxxexx[2]),
       episodeEnd: endRaw ? Number(endRaw) : null,
       index: sxxexx.index,
       length: sxxexx[0].length,
-      major: true,
     };
   }
 
@@ -186,20 +213,17 @@ function findEpisode(text: string, allowAnimeDash: boolean): EpisodeHit | null {
       episodeEnd: null,
       index: nxxnn.index + offset,
       length: nxxnn[0].length - offset,
-      major: true,
     };
   }
 
-  // 第12集 / 第十二集（仅阿拉伯数字）
-  const cn = text.match(/第\s*(\d{1,4})\s*[集话話期]/);
+  const cn = text.match(new RegExp(`第\\s*(${CN_NUMBER}{1,5})\\s*[集话話期]`));
   if (cn?.index !== undefined) {
     return {
       season: null,
-      episode: Number(cn[1]),
+      episode: mediaNumber(cn[1] ?? ''),
       episodeEnd: null,
       index: cn.index,
       length: cn[0].length,
-      major: true,
     };
   }
 
@@ -213,7 +237,6 @@ function findEpisode(text: string, allowAnimeDash: boolean): EpisodeHit | null {
       episodeEnd: null,
       index: ep.index + Math.max(0, offset),
       length: ep[0].length - Math.max(0, offset),
-      major: false,
     };
   }
 
@@ -227,13 +250,12 @@ function findEpisode(text: string, allowAnimeDash: boolean): EpisodeHit | null {
         episodeEnd: null,
         index: dash.index,
         length: dash[0].length,
-        major: false,
       };
     }
   }
 
   // 纯数字文件名：04.mkv / 第4集 之外的 "04 - 标题"
-  const bare = text.match(/^(\d{1,4})(?:v\d)?(?:\s|$)/);
+  const bare = text.match(/^(\d{1,3})(?:v\d)?(?=\s|[._-]|$)/);
   if (bare?.index !== undefined) {
     return {
       season: null,
@@ -241,7 +263,6 @@ function findEpisode(text: string, allowAnimeDash: boolean): EpisodeHit | null {
       episodeEnd: null,
       index: bare.index,
       length: bare[0].length,
-      major: false,
     };
   }
 
@@ -276,11 +297,8 @@ export function parseMediaFile(input: ParseInput): ParsedMedia {
   const dirInfo = titleFromDirs(input.fullPath);
   const ep = findEpisode(base, animeContext);
 
-  let season: number | null = ep?.season ?? null;
-  if (season === null && dirInfo.season !== null) season = dirInfo.season;
-
-  let episode: number | null = ep?.episode ?? null;
-  let episodeEnd: number | null = ep?.episodeEnd ?? null;
+  const episode = ep?.episode ?? null;
+  const episodeEnd = ep?.episodeEnd ?? null;
 
   // 标题：优先取集号标记之前的文本
   let titleSource = ep ? base.slice(0, ep.index) : base;
@@ -290,16 +308,19 @@ export function parseMediaFile(input: ParseInput): ParsedMedia {
     if (gi >= 0) titleSource = titleSource.slice(0, gi);
   }
 
-  let title = cleanTitle(titleSource);
+  const isSeries = episode !== null;
+  const namedSeason = isSeries ? seasonFromTitle(titleSource) : { title: cleanTitle(titleSource), season: null };
+  const season = isSeries ? (ep?.season ?? namedSeason.season ?? dirInfo.season ?? 1) : null;
+  let title = namedSeason.title;
   let titleFromDir = false;
 
   // 年份：在集号之前的部分里找，避免把集号误当年份
   const yearSource = ep ? base.slice(0, ep.index) : base;
-  const yearMatch = yearSource.match(/(?:^|[^\d])((?:19|20)\d{2})(?:[^\d]|$)/);
+  const yearMatch = yearSource.match(YEAR_PATTERN) ?? (ep ? base.slice(ep.index + ep.length).match(YEAR_PATTERN) : null);
   let year = yearMatch?.[1] ? Number(yearMatch[1]) : null;
 
   // 「1917」这类片名会被年份规则吃掉：标题为空时视为片名
-  if (year !== null && title.length === 0) {
+  if (!ep && year !== null && title.length === 0) {
     title = String(year);
     year = null;
   }
@@ -307,16 +328,6 @@ export function parseMediaFile(input: ParseInput): ParsedMedia {
   if (title.length < 2) {
     title = dirInfo.title || title || base;
     titleFromDir = title === dirInfo.title && dirInfo.title.length > 0;
-  }
-
-  // 季集信息来自目录、文件名只给集号时，标题必须是目录名
-  if (ep && !ep.major && title.length < 2 && dirInfo.title) {
-    title = dirInfo.title;
-    titleFromDir = true;
-  }
-  if (ep && dirInfo.title && title.length < 2) {
-    title = dirInfo.title;
-    titleFromDir = true;
   }
 
   // 文件名本身就是集号（04.mkv / 01.mp4）→ 标题只能来自目录
@@ -327,7 +338,15 @@ export function parseMediaFile(input: ParseInput): ParsedMedia {
 
   if (title.length < 1) title = base;
 
-  const isSeries = episode !== null;
+  // 目录标明的首播年份可区分同名翻拍。每一季的文件年份不参与聚合。
+  const titleKey = makeSeriesKey(title, null);
+  const seriesRoot = isSeries ? dirSegments(input.fullPath).slice(0, -1).findLast((dir) => {
+    const parsed = seasonFromTitle(dir);
+    return parsed.season === null && YEAR_PATTERN.test(dir) && makeSeriesKey(parsed.title, null) === titleKey;
+  }) : undefined;
+  const rootYear = seriesRoot?.match(YEAR_PATTERN)?.[1];
+  if (rootYear) year ??= Number(rootYear);
+
   let section: 'movie' | 'tv' | 'anime';
   if (isSeries) {
     section = animeContext || isAnimePath ? 'anime' : 'tv';
@@ -350,8 +369,9 @@ export function parseMediaFile(input: ParseInput): ParsedMedia {
     season,
     episode,
     episodeEnd,
-    seriesKey: isSeries ? makeSeriesKey(title, year) : null,
+    seriesKey: isSeries ? `${section}:${rootYear ? makeSeriesKey(title, Number(rootYear)) : titleKey}` : null,
     seriesTitle: isSeries ? title : null,
+    genres: GENRE_RULES.filter(([, rule]) => rule.test(input.fullPath.normalize('NFKC'))).map(([genre]) => genre),
     resolution,
     quality,
     videoCodec,

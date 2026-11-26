@@ -7,9 +7,8 @@ import { log } from '../logger';
 /**
  * 阿里云盘 provider。
  *
- * 路径语义：内部 path 就是阿里云盘的 file_id（根为 'root'）。
- * 云盘是 id 树而不是路径树，用 id 做路径可以让 scanner 的递归天然工作；
- * 代价是「同目录字幕自动发现」拿不到父目录，本期对 aliyun 不做字幕自动匹配。
+ * 配置盘继续用 file_id 作为内部路径，保留已入库条目的 ID。
+ * 其他盘用 drive_id:file_id，由浏览、扫描和播放共同使用。
  */
 
 /**
@@ -23,10 +22,17 @@ const MAX_PAGES = 60;
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const MEDIA_HEADERS = { Referer: 'https://www.aliyundrive.com/', 'User-Agent': UA };
+const PREVIEW_QUALITY = ['UHD', 'FHD', 'HD', 'SD', 'LD'];
 
-function gb(n: number): string {
-  if (!Number.isFinite(n) || n <= 0) return '0 GB';
-  return `${(n / 1024 ** 3).toFixed(1)} GB`;
+interface PreviewTask {
+  template_id?: string;
+  status?: string;
+  url?: string;
+}
+
+function usableUrl(value: unknown): value is string {
+  return typeof value === 'string' && value.startsWith('https://') && !/[{}]/.test(value);
 }
 
 export class AliyunProvider implements StorageProvider {
@@ -47,8 +53,7 @@ export class AliyunProvider implements StorageProvider {
   }
 
   private async ensureFresh(): Promise<void> {
-    if (this.token.expiresAt === 0) return;
-    if (Date.now() < this.token.expiresAt - 60_000) return;
+    if (this.token.accessToken && (this.token.expiresAt === 0 || Date.now() < this.token.expiresAt - 60_000)) return;
     await this.doRefresh();
   }
 
@@ -66,12 +71,13 @@ export class AliyunProvider implements StorageProvider {
 
   private async api<T>(path: string, body: unknown, allowRetry = true): Promise<T> {
     await this.ensureFresh();
+    const accessToken = this.token.accessToken;
     let res: Response;
     try {
       res = await fetch(WEB_API + path, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${this.token.accessToken}`,
+          Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
           'User-Agent': UA,
           // Web API 有来源校验：缺 Referer/Origin 时接口会返回空 items 而不是报错，
@@ -88,7 +94,7 @@ export class AliyunProvider implements StorageProvider {
     }
 
     if (res.status === 401 && allowRetry) {
-      await this.doRefresh();
+      if (this.token.accessToken === accessToken) await this.doRefresh();
       return this.api<T>(path, body, false);
     }
 
@@ -105,137 +111,65 @@ export class AliyunProvider implements StorageProvider {
 
   async test(): Promise<ProviderTestResult> {
     try {
-      const drive = await getDriveInfo(this.token.accessToken);
-      return {
-        ok: true,
-        message: `${drive.driveName}：已用 ${gb(drive.usedSize)} / ${gb(drive.totalSize)}`,
-      };
+      const entries = await this.list('');
+      return { ok: true, message: `连接成功，根目录共 ${entries.length} 项`, entryCount: entries.length };
     } catch (err) {
-      // token 过期时再试一次刷新
-      try {
-        await this.doRefresh();
-        const drive = await getDriveInfo(this.token.accessToken);
-        return { ok: true, message: `${drive.driveName}：已用 ${gb(drive.usedSize)} / ${gb(drive.totalSize)}` };
-      } catch {
-        return { ok: false, message: err instanceof Error ? err.message : String(err) };
-      }
+      return { ok: false, message: err instanceof Error ? err.message : String(err) };
     }
   }
 
-  /**
-   * 该账号下要尝试的 drive_id 列表。
-   * 一个阿里云盘账号有多个盘（资源库/默认盘/备份盘），媒体通常在资源库；
-   * 只用建源时记下的那一个 id，会出现「登录成功但 list 恒返回 0 项」。
-   */
-  private driveCandidatesCache: string[] | null = null;
-
   private async driveCandidates(): Promise<string[]> {
-    if (this.driveCandidatesCache) return this.driveCandidatesCache;
-    // config.driveId 优先：它可能来自用户在扫码时手填的「资源库 drive_id」。
-    // 实测 API（v2/user/get 与 v2/drive/get_default_drive）都只返回备份盘 id，
-    // 与网页版实际使用的不是同一个，因此必须允许人工指定。
-    const ids: string[] = [];
-    if (this.config.driveId) ids.push(this.config.driveId);
+    await this.ensureFresh();
+    const configured = this.config.driveId;
+    const accessToken = this.token.accessToken;
+    let ids: string[];
     try {
-      const info = await getDriveInfo(this.token.accessToken);
-      for (const id of info.allDriveIds) {
-        if (id && !ids.includes(id)) ids.push(id);
+      ids = (await getDriveInfo(accessToken)).allDriveIds;
+    } catch (err) {
+      if (!(err instanceof ProviderError) || err.status !== 401) {
+        if (!configured) throw err;
+        return [configured];
       }
-    } catch {
-      /* 探测失败时沿用 config 里的 id */
+      if (this.token.accessToken === accessToken) await this.doRefresh();
+      ids = (await getDriveInfo(this.token.accessToken)).allDriveIds;
     }
-    this.driveCandidatesCache = ids.length > 0 ? ids : [this.config.driveId];
-    if (this.driveCandidatesCache.length > 1) {
-      log('[aliyun] 候选盘:', this.driveCandidatesCache.join(' → '));
-    }
-    return this.driveCandidatesCache;
+    return [...new Set([...ids, configured].filter(Boolean))];
   }
 
   async list(dirPath: string): Promise<RemoteEntry[]> {
-    const parentId = !dirPath || dirPath === '/' ? (this.config.root || 'root') : dirPath;
-    const drives = await this.driveCandidates();
-
-    for (const driveId of drives) {
-      const items = await this.listFromDrive(driveId, parentId);
-      if (items.length > 0) {
-        log(`[aliyun] list drive=${driveId} parent=${parentId} → ${items.length} 项`);
-        return items;
-      }
-      log(`[aliyun] list drive=${driveId} parent=${parentId} → 0 项，试下一个盘`);
+    const path = !dirPath || dirPath === '/' ? this.config.root : dirPath;
+    if (path && path !== '/' && path !== 'root') {
+      const [driveId = '', fileId] = path.split(':', 2);
+      return fileId ? this.listFromDrive(driveId, fileId) : this.listFromDrive(this.config.driveId, path);
     }
 
-    log(`[aliyun] 所有盘在 parent=${parentId} 下均为空（共试 ${drives.length} 个盘）`);
-    // 只在根目录探测，避免递归时对每个子目录都跑一遍
-    if (parentId === 'root' || parentId === this.config.root) {
-      await this.probeMatrix(parentId);
-    }
-    return [];
-  }
-
-  /**
-   * 当所有盘都返回 0 项时，跑一次诊断矩阵并写日志。
-   *
-   * 目的：一次性区分「盘真的空」与「参数组合不对」。之前只知道 'root' 返回空，
-   * 没试过 '0'、空串、数字型 drive_id，也没验证过 openapi 域名下的 getDriveInfo
-   * 在真实 token 下是什么反应——这些信息缺失导致无法定位。
-   */
-  private async probeMatrix(parentId: string): Promise<void> {
-    const drives = await this.driveCandidates();
-    const driveId = drives[0] ?? this.config.driveId;
-    if (!driveId) return;
-
-    const variants: Array<{ name: string; body: Record<string, unknown> }> = [
-      { name: 'parent=root', body: { drive_id: driveId, parent_file_id: 'root', limit: 20, fields: '*' } },
-      { name: "parent='0'", body: { drive_id: driveId, parent_file_id: '0', limit: 20, fields: '*' } },
-      { name: "parent=''", body: { drive_id: driveId, parent_file_id: '', limit: 20, fields: '*' } },
-      { name: 'drive_id 为数字', body: { drive_id: Number(driveId) || driveId, parent_file_id: 'root', limit: 20, fields: '*' } },
-    ];
-
-    for (const v of variants) {
+    const entries: RemoteEntry[] = [];
+    let listed = false;
+    let missingDriveError: ProviderError | undefined;
+    for (const driveId of await this.driveCandidates()) {
       try {
-        const r = await this.api<{ items?: unknown[] }>('/adrive/v3/file/list', v.body);
-        log(`[aliyun][探测] ${v.name} → ${r.items?.length ?? 0} 项`);
+        entries.push(...await this.listFromDrive(driveId, 'root'));
+        listed = true;
       } catch (err) {
-        log(`[aliyun][探测] ${v.name} 失败:`, err instanceof Error ? err.message.slice(0, 120) : String(err));
+        if (!(err instanceof ProviderError) || err.status !== 404) throw err;
+        missingDriveError = err;
       }
     }
-
-    // 对照：开放平台的 getDriveInfo 在真实 token 下的反应
-    // （据此判断是否需要 OAuth token，而不是继续猜）
-    try {
-      const res = await fetch('https://openapi.alipan.com/adrive/v1.0/user/getDriveInfo', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.token.accessToken}`,
-          'Content-Type': 'application/json',
-          'User-Agent': UA,
-        },
-        body: '{}',
-        signal: AbortSignal.timeout(15000),
-      });
-      const text = await res.text();
-      log(`[aliyun][探测] openapi getDriveInfo → HTTP ${res.status}`, text.slice(0, 160));
-    } catch (err) {
-      log('[aliyun][探测] openapi getDriveInfo 请求失败:', err instanceof Error ? err.message.slice(0, 120) : String(err));
-    }
+    if (!listed) throw missingDriveError ?? new ProviderError('没有可读取的阿里云盘');
+    return entries;
   }
 
   private async listFromDrive(driveId: string, parentId: string): Promise<RemoteEntry[]> {
-    // v3 是当前 Web 端用的接口；v2 是旧版，参数更宽松。
-    // 两者都试一遍，避免某个接口对 parent_file_id 的约定不同导致静默返回空。
-    for (const endpoint of ['/adrive/v3/file/list', '/v2/file/list']) {
-      try {
-        const items = await this.listPage(driveId, parentId, endpoint);
-        if (items.length > 0) return items;
-        log(`[aliyun] ${endpoint} drive=${driveId} parent=${parentId} → 0 项`);
-      } catch (err) {
-        log(`[aliyun] ${endpoint} 失败：`, err instanceof Error ? err.message.slice(0, 160) : String(err));
-      }
+    try {
+      return await this.listPages(driveId, parentId, '/adrive/v3/file/list');
+    } catch (err) {
+      if (!(err instanceof ProviderError) || err.status !== 404) throw err;
+      log('[aliyun] 使用旧版目录接口重试', err.message);
+      return this.listPages(driveId, parentId, '/v2/file/list');
     }
-    return [];
   }
 
-  private async listPage(driveId: string, parentId: string, endpoint: string): Promise<RemoteEntry[]> {
+  private async listPages(driveId: string, parentId: string, endpoint: string): Promise<RemoteEntry[]> {
     const out: RemoteEntry[] = [];
     let marker = '';
 
@@ -257,7 +191,9 @@ export class AliyunProvider implements StorageProvider {
         next_marker?: string;
       }>(endpoint, body);
 
-      for (const it of res.items ?? []) {
+      if (!Array.isArray(res?.items)) throw new ProviderError('阿里云盘目录接口返回了无效的文件列表');
+
+      for (const it of res.items) {
         const fileId = String(it['file_id'] ?? it['id'] ?? '');
         const name = String(it['name'] ?? '');
         if (!fileId || !name) continue;
@@ -266,7 +202,7 @@ export class AliyunProvider implements StorageProvider {
         const updated = it['updated_at'];
         const mtime = typeof updated === 'string' ? Date.parse(updated) : 0;
         out.push({
-          path: fileId,
+          path: driveId === this.config.driveId ? fileId : `${driveId}:${fileId}`,
           name,
           isDir: type === 'folder',
           size: Number.isFinite(size) ? size : 0,
@@ -274,51 +210,68 @@ export class AliyunProvider implements StorageProvider {
         });
       }
 
-      marker = res.next_marker ?? '';
-      if (!marker) break;
+      if (!res.next_marker) return out;
+      if (res.next_marker === marker) throw new ProviderError('阿里云盘目录分页重复');
+      marker = res.next_marker;
     }
 
-    return out;
+    throw new ProviderError('阿里云盘目录超过分页上限');
+  }
+
+  private fileRequest(path: string): { drive_id: string; file_id: string } {
+    const [first = '', scopedFileId] = path.split(':', 2);
+    return { drive_id: scopedFileId ? first : this.config.driveId, file_id: scopedFileId ?? path };
+  }
+
+  async getArtwork(path: string, video: boolean): Promise<ResolvedMedia | null> {
+    const file = await this.api<{ thumbnail?: string }>('/v2/file/get', {
+      ...this.fileRequest(path),
+      ...(video ? { video_thumbnail_process: 'video/snapshot,t_0,f_jpg,w_480' }
+        : { image_thumbnail_process: 'image/resize,w_480/format,jpg' }),
+    });
+    return usableUrl(file.thumbnail) ? { url: file.thumbnail, headers: MEDIA_HEADERS } : null;
   }
 
   async resolvePlayUrl(path: string): Promise<ResolvedMedia> {
-    const fileId = path;
-    const headers: Record<string, string> = {
-      Referer: 'https://www.aliyundrive.com/',
-      'User-Agent': UA,
-      Authorization: `Bearer ${this.token.accessToken}`,
-    };
+    const file = this.fileRequest(path);
+    let lastError: Error | null = null;
 
-    // 1) 优先直链（需要该账号/token 具备下载权限，失败就换转码）
     try {
-      const dl = await this.api<{ url?: string }>('/v2/file/get_download_url', {
-        drive_id: this.config.driveId,
-        file_id: fileId,
+      const dl = await this.api<{ url?: string; cdn_url?: string }>('/v2/file/get_download_url', {
+        ...file,
         expire_sec: 14400,
       });
-      if (dl.url) return { url: dl.url, headers };
-    } catch {
-      /* 落到转码分支 */
+      const url = [dl.url, dl.cdn_url].find(usableUrl);
+      if (url) return { url, headers: MEDIA_HEADERS };
+    } catch (err) {
+      if (err instanceof ProviderError && err.status === 401) throw err;
+      if (err instanceof Error) lastError = err;
     }
 
-    // 2) 转码播放列表（m3u8，mpv 原生支持 HLS）
-    const info = await this.api<{
-      video_preview_play_info?: {
-        live_transcoding_task_list?: Array<{ template_id?: string; url?: string }>;
-      };
-    }>('/v2/file/get_video_preview_play_info', {
-      drive_id: this.config.driveId,
-      file_id: fileId,
-      category: 'live_transcoding',
-      template_id: '',
-    });
+    let preparing = false;
+    for (const category of ['live_transcoding', 'quick_video']) {
+      try {
+        const info = await this.api<{
+          code?: string;
+          video_preview_play_info?: { live_transcoding_task_list?: PreviewTask[]; quick_video_list?: PreviewTask[] };
+        }>('/v2/file/get_video_preview_play_info', { ...file, category });
+        const lists = info.video_preview_play_info;
+        const tasks = [...(lists?.live_transcoding_task_list ?? []), ...(lists?.quick_video_list ?? [])];
+        const ready = tasks.filter((task) => (!task.status || task.status === 'finished') && usableUrl(task.url));
+        const best = PREVIEW_QUALITY.map((quality) => ready.find((task) => task.template_id === quality)).find(Boolean) ?? ready[0];
+        if (best?.url) return { url: best.url, headers: MEDIA_HEADERS };
+        preparing ||= info.code === 'VideoPreviewWaitAndRetry' || tasks.some((task) => task.status === 'running' || task.status === 'pending');
+      } catch (err) {
+        if (err instanceof ProviderError && err.status === 401) throw err;
+        if (err instanceof Error) lastError = err;
+      }
+    }
 
-    const tasks = info.video_preview_play_info?.live_transcoding_task_list ?? [];
-    const pick = tasks.find((t) => t.template_id === 'FHD') ?? tasks.find((t) => Boolean(t.url)) ?? tasks[0];
-    if (pick?.url) return { url: pick.url, headers };
-
-    throw new ProviderError(
-      '阿里云盘没有返回可播放地址：可能是文件夹、该账号无下载权限，或视频转码尚未就绪',
-    );
+    if (preparing) throw new ProviderError('阿里云盘正在转码，请稍后重试这一集');
+    if (lastError instanceof ProviderError && lastError.status === 403) {
+      throw new ProviderError('阿里云盘拒绝了该文件的播放请求，请在网盘中检查该文件的播放权限', 403);
+    }
+    if (lastError && !(lastError instanceof ProviderError && lastError.status === 404)) throw lastError;
+    throw new ProviderError('阿里云盘暂时没有提供可用的播放地址');
   }
 }

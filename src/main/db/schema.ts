@@ -1,6 +1,6 @@
 /** SQLite DDL — 迁移通过 PRAGMA user_version 递增执行 */
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 3;
 
 export const DDL_V1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -71,3 +71,13 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL
 );
 `;
+
+export const DDL_V2 = `
+ALTER TABLE items ADD COLUMN genres TEXT NOT NULL DEFAULT '[]';
+CREATE TABLE work_genres (
+  work_key TEXT PRIMARY KEY,
+  genres TEXT NOT NULL
+);
+`;
+
+export const DDL_V3 = `ALTER TABLE items ADD COLUMN poster_item_id TEXT;`;

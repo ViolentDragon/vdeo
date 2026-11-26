@@ -70,13 +70,15 @@ export class WebdavProvider implements StorageProvider {
 
   constructor(private readonly config: WebdavSourceConfig) {
     this.baseUrl = config.url.replace(/\/+$/, '');
-    let basePath = '/';
     try {
-      basePath = new URL(this.baseUrl).pathname.replace(/\/+$/, '');
+      const base = new URL(this.baseUrl);
+      if (base.protocol !== 'https:' && base.protocol !== 'http:') {
+        throw new Error('unsupported protocol');
+      }
+      this.basePath = decodeURIComponent(base.pathname).replace(/\/+$/, '');
     } catch {
-      throw new ProviderError(`WebDAV 地址无法解析：${config.url}`);
+      throw new ProviderError('请输入以 http:// 或 https:// 开头的有效 WebDAV 地址');
     }
-    this.basePath = basePath === '' ? '' : basePath;
     this.authHeader = `Basic ${Buffer.from(`${config.username}:${config.password}`, 'utf8').toString('base64')}`;
   }
 
@@ -90,27 +92,20 @@ export class WebdavProvider implements StorageProvider {
   }
 
   /** 把响应里的 href 归一成"源内绝对路径"（不含 base 的 pathname 前缀） */
-  private hrefToPath(href: string): string | null {
-    let raw = href;
-    if (!/^[a-z]+:\/\//i.test(raw)) {
-      // 服务器可能返回相对路径或绝对路径
-      raw = raw.startsWith('/') ? this.baseUrl + raw : `${this.baseUrl}/${raw}`;
-    }
-    let url: URL;
+  private hrefToPath(href: string, directoryUrl: string): string | null {
+    let pathname: string;
     try {
-      url = new URL(raw);
+      pathname = new URL(href, directoryUrl).pathname;
     } catch {
       return null;
     }
-    let decoded: string;
     try {
-      decoded = decodeURIComponent(url.pathname);
+      pathname = decodeURIComponent(pathname);
     } catch {
-      decoded = url.pathname;
+      // 部分服务直接在文件名中返回未编码的百分号。
     }
-    if (this.basePath && decoded.startsWith(this.basePath)) decoded = decoded.slice(this.basePath.length);
-    decoded = decoded.replace(/\/+$/, '');
-    return decoded === '' ? '/' : decoded;
+    if (this.basePath && pathname !== this.basePath && !pathname.startsWith(`${this.basePath}/`)) return null;
+    return pathname.slice(this.basePath.length).replace(/\/+$/, '') || '/';
   }
 
   private async request(path: string, init: RequestInit): Promise<Response> {
@@ -146,7 +141,7 @@ export class WebdavProvider implements StorageProvider {
   }
 
   async list(dirPath: string): Promise<RemoteEntry[]> {
-    const target = dirPath || this.config.root || '/';
+    const target = `/${(dirPath || this.config.root || '/').replace(/^\/+|\/+$/g, '')}`;
     const res = await this.request(target, {
       method: 'PROPFIND',
       headers: { Depth: '1', 'Content-Type': 'application/xml; charset=utf-8' },
@@ -157,13 +152,16 @@ export class WebdavProvider implements StorageProvider {
       throw new ProviderError(`PROPFIND 返回 ${res.status} ${res.statusText}（路径：${target}）`, res.status);
     }
     const xml = await res.text();
+    if (!/<(?:[\w.-]+:)?multistatus[\s/>]/i.test(xml)) {
+      throw new ProviderError('服务器未返回 WebDAV 目录。请检查地址是否指向 WebDAV 服务。');
+    }
     const responses = parsePropfindXml(xml);
-    const selfPath = target.replace(/\/+$/, '') || '/';
+    const directoryUrl = this.urlFor(target === '/' ? target : `${target}/`);
     const seen = new Set<string>();
     const entries: RemoteEntry[] = [];
     for (const r of responses) {
-      const p = this.hrefToPath(r.href);
-      if (!p || p === selfPath || seen.has(p)) continue;
+      const p = this.hrefToPath(r.href, directoryUrl);
+      if (!p || p === target || seen.has(p)) continue;
       seen.add(p);
       const name = p.slice(p.lastIndexOf('/') + 1) || p;
       if (!name) continue;

@@ -173,3 +173,53 @@ test('播放进度写入与继续观看查询', () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('片库将同一作品的跨年季度和重复集数聚合，并支持题材筛选与更正', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nebula-catalog-'));
+  const first = join(root, '古装', '庆余年');
+  const second = join(first, '第二季');
+  mkdirSync(second, { recursive: true });
+  writeFileSync(join(first, '庆余年.S01.E01.2019.1080p.mp4'), 'x');
+  writeFileSync(join(first, '庆余年.S01E01.2019.2160p.mkv'), 'x');
+  writeFileSync(join(first, '庆余年.S00E01.2019.mp4'), 'x');
+  writeFileSync(join(first, '宣传海报.jpg'), 'x');
+  writeFileSync(join(second, '庆余年第二季.第十二集.2024.mp4'), 'x');
+  writeFileSync(join(root, 'The.Matrix.1999.1080p.mp4'), 'x');
+  writeFileSync(join(root, 'The.Matrix.1999.2160p.mkv'), 'x');
+  const repo = createRepository(':memory:');
+  try {
+    const source = makeSource(root);
+    const provider = new LocalProvider([root]);
+    repo.insertSource(source);
+    const scan = () => scanSource({ source, provider, repo, ignorePatterns: [] });
+    assert.equal((await scan()).found, 7);
+    assert.equal(repo.browse({ group: 'catalog' }).total, 2);
+    const result = repo.browse({ group: 'catalog', search: 'S01.E01', genre: '古装' });
+    assert.equal(result.total, 1);
+    const entry = result.entries?.[0];
+    assert.ok(entry?.kind === 'series' && entry.workKey);
+    assert.equal(entry.series.title, '庆余年');
+    assert.equal(entry.series.year, 2019);
+    assert.deepEqual(entry.series.seasons, [0, 1, 2]);
+    assert.equal(entry.series.episodeCount, 3);
+    const detail = repo.getSeries(entry.series.key);
+    assert.deepEqual(detail?.items.map((item) => [item.season, item.episode]), [[1, 1], [2, 12], [0, 1]]);
+    assert.equal(detail?.items[0]?.resolution, '2160p');
+    assert.equal(entry.series.artworkId, detail?.items[0]?.id);
+    assert.equal(detail?.summary.artworkId, entry.series.artworkId);
+    const posterId = repo.browse({ section: 'photo' }).items[0]?.id;
+    assert.ok(posterId);
+    assert.equal(entry.series.posterItemId, posterId);
+    assert.equal(detail?.summary.posterItemId, posterId);
+    repo.updateWorkGenres(entry.workKey, ['剧情', '奇幻']);
+    await scan();
+    assert.equal(repo.browse({ group: 'catalog', genre: '古装' }).total, 0);
+    assert.equal(repo.browse({ group: 'catalog', genre: '剧情' }).total, 1);
+    assert.deepEqual(repo.getSeries(entry.series.key)?.summary.genres, ['剧情', '奇幻']);
+    repo.updateWorkGenres(entry.workKey, null);
+    assert.equal(repo.browse({ group: 'catalog', genre: '古装' }).total, 1);
+  } finally {
+    repo.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

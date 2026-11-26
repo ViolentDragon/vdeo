@@ -34,12 +34,11 @@
 
 ## 网盘接入方式（重要，请先读）
 
-内置的是一等公民 **WebDAV 客户端** + 本地目录。这是刻意的：
+打开「添加存储源 → 网盘」，选择品牌卡片。阿里云盘支持在应用内扫码授权。
 
-**Alist / OpenList 可以把百度网盘、阿里云盘、夸克、115、OneDrive、Google Drive、PikPak 等统一挂载成 WebDAV。**
-因此在本应用「添加存储源 → WebDAV」里填入 Alist 的地址与账号，就能一次性接入这些网盘。
+115网盘、夸克网盘、UC网盘、光鸭云盘、天翼云盘和123网盘通过 [OpenList WebDAV](https://doc.oplist.org/guide/advanced/webdav) 接入。先在 OpenList 添加对应驱动并完成授权，为连接账号开启「WebDAV 读取」权限。然后在对应卡片中填写 WebDAV 地址（例如 `http://127.0.0.1:5244/dav`）、网盘在服务中的挂载路径和连接账号。应用会先验证目录能否读取，再保存存储源。
 
-阿里云盘 / 百度网盘的官方 API 直连需要开发者应用审核与 OAuth 回调，当前版本**没有**内置。选择这些类型时会得到明确提示，而不是一个假装能用的按钮。
+其他 WebDAV 服务可通过「添加存储源 → WebDAV」接入。本地磁盘可从同一弹窗选择。
 
 ## 运行
 
@@ -54,6 +53,14 @@ npm run typecheck               # 主进程与渲染层分别做类型检查
 ```
 
 数据位置：`%APPDATA%/Nebula/nebula.db`（SQLite，与会话/缓存同目录）。
+
+### 一键打包和发布
+
+在 Windows 双击 `update-release.cmd` 或运行 `npm run update`。脚本从本地和 GitHub 标签计算下一个补丁版本，验证并打包安装版与便携版，再将 Git 未忽略的工作区更改和版本文件提交到当前分支。分支与版本标签会一起推送到 `origin`。推送成功后，GitHub Actions 从该标签构建并发布 Release。
+
+- 本地程序包在 `release/v版本号/`。只生成当前版本的本地程序包可运行 `npm run update -- --package-only`。
+- 发布使用已有的 GitHub Git 凭据。首次推送包含工作流文件，需要允许修改 GitHub Actions 工作流的凭据。仓库须启用 Actions，并允许该工作流创建 Release。脚本会输出 Actions 和 Release 的地址。
+- 如果推送失败，排除问题后重新执行同一命令可继续推送本地版本。如果 GitHub 构建或上传失败，可在 Actions 中重跑该工作流。
 
 ### 内置 mpv
 
