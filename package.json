@@ -15,8 +15,9 @@
     "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
     "test": "node --test --import tsx test/*.test.ts",
     "icon": "python scripts/make-icon.py",
-    "pack:dir": "npm run build && electron-builder --win --x64 --dir",
-    "pack": "npm run build && electron-builder --win --x64"
+    "vendor:mpv": "node scripts/vendor-mpv.mjs",
+    "pack:dir": "npm run build && node scripts/vendor-mpv.mjs && electron-builder --win --x64 --dir",
+    "pack": "npm run build && node scripts/vendor-mpv.mjs && electron-builder --win --x64"
   },
   "build": {
     "appId": "com.nebula.mediaplayer",
@@ -32,6 +33,12 @@
       "package.json"
     ],
     "asar": true,
+    "extraResources": [
+      {
+        "from": "vendor/mpv",
+        "to": "mpv"
+      }
+    ],
     "win": {
       "icon": "build/icon.ico",
       "requestedExecutionLevel": "asInvoker",

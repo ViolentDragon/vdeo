@@ -12,6 +12,8 @@ export interface MpvOptions {
   /** 目标窗口句柄（十进制字符串）；给出时用 --wid 嵌入 */
   wid?: string | null;
   hardwareDecode: boolean;
+  /** 附加命令行参数：测试用 --vo=null 静默解码，用户也可自定义 */
+  extraArgs?: string[];
 }
 
 const INITIAL_STATE: PlayerState = {
@@ -91,6 +93,7 @@ export class MpvController extends EventEmitter {
       `--hwdec=${this.opts.hardwareDecode ? 'auto-safe' : 'no'}`,
     ];
     if (this.opts.wid) args.push(`--wid=${this.opts.wid}`);
+    if (this.opts.extraArgs?.length) args.push(...this.opts.extraArgs);
 
     this.stopping = false;
     const proc = spawn(this.opts.mpvPath, args, {
@@ -246,7 +249,9 @@ export class MpvController extends EventEmitter {
         break;
       }
       case 'idle':
-        this.patch({ status: 'idle' });
+        // mpv 加载失败后会立刻回到 idle（--idle=yes）。不能让它覆盖 error，
+        // 否则用户看不到失败原因，UI 只显示一个空白的"空闲"。
+        if (this.state.status !== 'error') this.patch({ status: 'idle' });
         break;
       default:
         break;

@@ -47,8 +47,23 @@ function candidatePaths(): string[] {
 
 export interface MpvLocation {
   path: string | null;
-  source: 'configured' | 'path' | 'candidate' | 'none';
+  source: 'configured' | 'bundled' | 'path' | 'candidate' | 'none';
   message: string;
+}
+
+/**
+ * 打包时随应用一起分发的 mpv（electron-builder extraResources → resources/mpv/）。
+ * 开发模式下 process.resourcesPath 指向 Electron 自带的 resources，那里没有 mpv，自然返回 null。
+ */
+function bundledMpvPath(): string | null {
+  const resources = process.resourcesPath;
+  if (!resources) return null;
+  const base = join(resources, 'mpv');
+  for (const name of CANDIDATE_NAMES) {
+    const p = join(base, name);
+    if (isExecutable(p)) return p;
+  }
+  return null;
 }
 
 export async function locateMpv(configured: string | null): Promise<MpvLocation> {
@@ -62,6 +77,12 @@ export async function locateMpv(configured: string | null): Promise<MpvLocation>
       message: `设置里指定的 mpv 路径不可执行：${configured}`,
     };
   }
+  // 内置 mpv 优先于 PATH/常见位置：避免用户机器上的旧版本盖掉随应用分发的版本
+  const bundled = bundledMpvPath();
+  if (bundled) {
+    return { path: bundled, source: 'bundled', message: `使用内置 mpv：${bundled}` };
+  }
+
   const onPath = await findOnPath();
   if (onPath) return { path: onPath, source: 'path', message: `在 PATH 中找到 mpv：${onPath}` };
 
