@@ -17,6 +17,7 @@ import {
   type SourceKind,
   type StorageSource,
 } from '../shared/types';
+import { ALIST_BRIDGE_STEPS, CLOUD_DRIVES } from '../shared/drives';
 import { IPC, type Rpc } from '../shared/ipc-contract';
 
 const api = window.nebula;
@@ -81,7 +82,7 @@ export default function App() {
   const [player, setPlayer] = useState<PlayerState | null>(null);
   const [scan, setScan] = useState<ScanProgress | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
-  const [addOpen, setAddOpen] = useState(false);
+  const [addKind, setAddKind] = useState<SourceKind | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -334,7 +335,7 @@ export default function App() {
               </button>
             ))
           )}
-          <button className="btn btn--ghost btn--full" onClick={() => setAddOpen(true)}>
+          <button className="btn btn--ghost btn--full" onClick={() => setAddKind('local')}>
             + 添加存储源
           </button>
         </div>
@@ -384,11 +385,11 @@ export default function App() {
         ) : null}
 
         {nav === 'settings' ? (
-          <SettingsPanel settings={settings} onSave={updateSettings} />
+          <SettingsPanel settings={settings} onSave={updateSettings} sources={sources} onOpenAddSource={(k) => setAddKind(k)} />
         ) : nav === 'sources' ? (
           <SourcesPanel
             sources={sources}
-            onAdd={() => setAddOpen(true)}
+            onAdd={() => setAddKind('local')}
             onRemove={async (id) => {
               await call(IPC.sourcesRemove, { id });
               await loadSources();
@@ -583,11 +584,12 @@ export default function App() {
         </div>
       ) : null}
 
-      {addOpen ? (
+      {addKind ? (
         <AddSourceDialog
-          onClose={() => setAddOpen(false)}
+          initialKind={addKind}
+          onClose={() => setAddKind(null)}
           onCreated={async () => {
-            setAddOpen(false);
+            setAddKind(null);
             await loadSources();
             notify('存储源已添加，可以开始扫描了');
           }}
@@ -747,9 +749,13 @@ const ENGINE_OPTIONS: Array<{ value: PlayerEngine; label: string; hint: string }
 function SettingsPanel({
   settings,
   onSave,
+  sources,
+  onOpenAddSource,
 }: {
   settings: AppSettings | null;
   onSave: (patch: Partial<AppSettings>) => Promise<void>;
+  sources: StorageSource[];
+  onOpenAddSource: (kind: 'local' | 'webdav' | 'aliyun') => void;
 }) {
   const [mpvPath, setMpvPath] = useState(settings?.mpvPath ?? '');
   const [hwdec, setHwdec] = useState(settings?.hardwareDecode ?? true);
@@ -792,6 +798,51 @@ function SettingsPanel({
 
   return (
     <section className="panel">
+      <div className="panel__head">
+        <h2>网盘连接</h2>
+        <span className="drive-count">
+          {sources.length > 0 ? `已连接 ${sources.length} 个源` : '未连接'}
+        </span>
+      </div>
+      <p className="panel__lede">
+        阿里云盘可直接扫码授权。其余网盘建议经 Alist / OpenList 转成 WebDAV 后接入——这是目前唯一稳定、不依赖私有接口的方式。
+      </p>
+      <div className="drive-grid">
+        {CLOUD_DRIVES.map((d) => {
+          const connected =
+            (d.id === 'aliyun' && sources.some((s) => s.kind === 'aliyun')) ||
+            (d.status === 'bridge' &&
+              sources.some((s) => s.kind === 'webdav' && s.name.includes(d.name.replace('网盘', ''))));
+          const badge = connected ? '已连接' : d.status === 'ready' ? '可接入' : '经 Alist';
+          return (
+            <button
+              key={d.id}
+              className={`drive-card ${connected ? 'is-connected' : ''}`}
+              onClick={() => {
+                if (d.targetKind) onOpenAddSource(d.targetKind);
+              }}
+              title={d.guide}
+            >
+              <span className="drive-card__mark" style={{ background: d.color }}>
+                {d.mark}
+              </span>
+              <span className="drive-card__name">{d.name}</span>
+              <span className="drive-card__auth">{d.authLabel}</span>
+              <span className={`drive-card__badge ${connected ? 'is-on' : ''}`}>{badge}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="panel__note">
+        <h3>其余网盘的接入步骤</h3>
+        <ol className="steps">
+          {ALIST_BRIDGE_STEPS.map((s) => (
+            <li key={s}>{s}</li>
+          ))}
+        </ol>
+      </div>
+
       <div className="panel__head">
         <h2>播放</h2>
       </div>
@@ -956,8 +1007,16 @@ function SettingsPanel({
 
 const SOURCE_TABS: SourceKind[] = ['local', 'webdav', 'aliyun'];
 
-function AddSourceDialog({ onClose, onCreated }: { onClose: () => void; onCreated: () => Promise<void> }) {
-  const [kind, setKind] = useState<SourceKind>('local');
+function AddSourceDialog({
+  onClose,
+  onCreated,
+  initialKind = 'local',
+}: {
+  onClose: () => void;
+  onCreated: () => Promise<void>;
+  initialKind?: SourceKind;
+}) {
+  const [kind, setKind] = useState<SourceKind>(initialKind);
   const [name, setName] = useState('');
   const [roots, setRoots] = useState<string[]>([]);
   const [url, setUrl] = useState('');
