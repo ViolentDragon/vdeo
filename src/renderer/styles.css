@@ -1028,3 +1028,33 @@ select {
   background: rgba(255, 255, 255, 0.06);
   font-size: 11.5px;
 }
+
+/* ---------------- 阿里云盘扫码授权 ---------------- */
+
+.qr-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 14px;
+  margin: 8px 0;
+  border-radius: 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+}
+
+.qr {
+  width: 220px;
+  height: 220px;
+  padding: 8px;
+  border-radius: 10px;
+  background: #fff;
+  image-rendering: pixelated;
+}
+
+.qr-status {
+  min-height: 20px;
+  margin: 4px 0 8px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  text-align: center;
+  line-height: 1.6;
+}

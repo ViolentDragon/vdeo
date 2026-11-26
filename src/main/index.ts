@@ -5,6 +5,7 @@ import { initLogger, log } from './logger';
 import { IPC, type Rpc } from '../shared/ipc-contract';
 import { DEFAULT_PLAYER_CONFIG } from '../shared/types';
 import type {
+  AliyunSourceConfig,
   AppSettings,
   BrowseQuery,
   MediaItem,
@@ -17,6 +18,7 @@ import type {
 import { createRepository, type Repository } from './db';
 import { sourceId as newSourceId } from './db/ids';
 import { createProvider } from './sources/registry';
+import { getDriveInfo, pollQrLogin, startQrLogin, type QrSession } from './sources/aliyun-auth';
 import { encryptSecret } from './sources/secrets';
 import { parentOf, type StorageProvider } from './sources/types';
 import { scanSource } from './scan/scanner';
@@ -31,6 +33,7 @@ let settings: AppSettings;
 let controller: MpvController | null = null;
 let mpvPath: string | null = null;
 const scanning = new Map<string, AbortController>();
+const qrSessions = new Map<string, QrSession>();
 
 const DEFAULT_SETTINGS: AppSettings = {
   mpvPath: null,
@@ -107,12 +110,31 @@ function requireItem(id: string): MediaItem {
   return item;
 }
 
+/** 统一的 provider 工厂：阿里云盘 token 轮换后必须写回数据库，否则重启即失效 */
+function providerFor(source: StorageSource): ReturnType<typeof createProvider> {
+  return createProvider(source, {
+    onAliyunTokenRefreshed: (sourceId, token) => {
+      const s = repo.getSource(sourceId);
+      if (!s || s.config.kind !== 'aliyun') return;
+      const cfg = s.config as AliyunSourceConfig;
+      s.config = {
+        ...cfg,
+        accessToken: encryptSecret(token.accessToken),
+        refreshToken: encryptSecret(token.refreshToken),
+        expiresAt: token.expiresAt,
+      };
+      repo.updateSource(s);
+      log('[aliyun] access_token 已刷新并写回');
+    },
+  });
+}
+
 /* ----------------------------- 扫描 ----------------------------- */
 
 async function runScan(sourceId: string): Promise<ScanSummary> {
   const source = requireSource(sourceId);
   if (scanning.has(sourceId)) throw new Error('该源正在扫描中');
-  const provider = createProvider(source);
+  const provider = providerFor(source);
   const ac = new AbortController();
   scanning.set(sourceId, ac);
 
@@ -266,7 +288,7 @@ async function playWithExternal(
 async function handlePlay(itemId: string): Promise<{ mode: 'mpv' | 'external'; message: string }> {
   const item = requireItem(itemId);
   const source = requireSource(item.sourceId);
-  const provider = createProvider(source);
+  const provider = providerFor(source);
   const resolved = await provider.resolvePlayUrl(item.path);
   const record = repo.getPlayback(item.id);
   const startAt = record && !record.finished && record.position > 5 ? record.position : 0;
@@ -370,18 +392,30 @@ function createWindow(): void {
     win.webContents.once('did-finish-load', () => {
       setTimeout(() => {
         const view = process.env['NEBULA_CAPTURE_VIEW'];
-        const switchView = view
-          ? win?.webContents
-              .executeJavaScript(
-                `(() => {
-                  const items = [...document.querySelectorAll('.nav__item')];
-                  const hit = items.find((el) => el.textContent && el.textContent.includes(${JSON.stringify(view)}));
-                  if (hit) hit.click();
-                  return Boolean(hit);
-                })()`,
-              )
-              .catch(() => false)
-          : Promise.resolve(false);
+        // 支持逗号分隔的多步点击：先按文本找可点元素逐个点，再截图。
+        // 例：NEBULA_CAPTURE_VIEW="添加存储源,阿里云盘,生成二维码"
+        const steps = (view ?? '')
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const clickStep = async (text: string): Promise<void> => {
+          if (!win) return;
+          await win.webContents
+            .executeJavaScript(
+              `(() => {
+                const nodes = [...document.querySelectorAll('button, [role="button"], label, .nav__item, .tab')];
+                const hit = nodes.find((el) => el.textContent && el.textContent.includes(${JSON.stringify('__TEXT__')}));
+                if (hit) { hit.click(); return true; }
+                return false;
+              })()`.replace(JSON.stringify('__TEXT__'), JSON.stringify(text)),
+            )
+            .catch(() => false);
+          await new Promise((r) => setTimeout(r, 450));
+        };
+        const switchView = (async () => {
+          for (const text of steps) await clickStep(text);
+          return steps.length > 0;
+        })();
         void switchView.then(() => {
           setTimeout(() => {
             void win?.webContents
@@ -472,6 +506,53 @@ function registerIpc(): void {
     };
   });
 
+  handle(IPC.aliyunQrStart, async () => {
+    // 顺手清理过期会话，避免长期驻留
+    for (const [id, s] of qrSessions) {
+      if (Date.now() - s.createdAt > 3 * 60_000) qrSessions.delete(id);
+    }
+    const session = await startQrLogin();
+    qrSessions.set(session.id, session);
+    log('[aliyun] 已生成扫码会话');
+    return { sessionId: session.id, qrDataUrl: session.qrDataUrl, expiresInSec: 180 };
+  });
+
+  handle(IPC.aliyunQrPoll, async (payload: { sessionId: string; name?: string }) => {
+    const session = qrSessions.get(payload.sessionId);
+    if (!session) throw new Error('二维码会话已失效，请重新生成');
+    const res = await pollQrLogin(session);
+    if (res.status !== 'CONFIRMED') return { status: res.status };
+    if (!res.token) {
+      throw new Error('已扫码确认，但未能从响应中解析出 token（接口结构可能已变化）');
+    }
+    const drive = await getDriveInfo(res.token.accessToken);
+    const config: AliyunSourceConfig = {
+      kind: 'aliyun',
+      driveId: drive.driveId,
+      refreshToken: encryptSecret(res.token.refreshToken),
+      accessToken: encryptSecret(res.token.accessToken),
+      expiresAt: res.token.expiresAt,
+      userName: res.token.userName ?? drive.driveName,
+      root: 'root',
+    };
+    const source: StorageSource = {
+      id: newSourceId(),
+      kind: 'aliyun',
+      name: (payload.name ?? '').trim() || drive.driveName || '阿里云盘',
+      config,
+      enabled: true,
+      lastScanAt: null,
+      lastScanCount: 0,
+      lastError: null,
+      createdAt: Date.now(),
+    };
+    repo.insertSource(source);
+    qrSessions.delete(payload.sessionId);
+    log('[aliyun] 扫码授权成功，已挂载', source.name, drive.driveId);
+    broadcast(IPC.evLibrary, { reason: 'source-added', sourceId: source.id });
+    return { status: 'CONFIRMED' as const, source, driveName: drive.driveName };
+  });
+
   handle(IPC.pickExecutable, async () => {
     const res = await dialog.showOpenDialog({
       properties: ['openFile'],
@@ -532,7 +613,7 @@ function registerIpc(): void {
 
   handle(IPC.sourcesTest, async (payload: { id: string }) => {
     const source = requireSource(payload.id);
-    const provider = createProvider(source);
+    const provider = providerFor(source);
     return provider.test();
   });
 

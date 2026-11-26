@@ -11,6 +11,9 @@ export const IPC = {
   playersDetect: 'players:detect',
   playersTest: 'players:test',
 
+  aliyunQrStart: 'aliyun:qr-start',
+  aliyunQrPoll: 'aliyun:qr-poll',
+
   sourcesList: 'sources:list',
   sourcesCreate: 'sources:create',
   sourcesUpdate: 'sources:update',

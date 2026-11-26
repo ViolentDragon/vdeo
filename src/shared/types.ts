@@ -45,7 +45,14 @@ export interface WebdavSourceConfig {
 export interface AliyunSourceConfig {
   kind: 'aliyun';
   driveId: string;
+  /** refresh_token，加密存储 */
   refreshToken: string;
+  /** access_token，加密存储；失效时用 refreshToken 换 */
+  accessToken: string;
+  /** access_token 过期时间（毫秒），0 表示未知 */
+  expiresAt: number;
+  userName: string | null;
+  /** 起始目录的 file_id，'root' 为网盘根 */
   root: string;
 }
 

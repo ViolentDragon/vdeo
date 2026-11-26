@@ -954,6 +954,8 @@ function SettingsPanel({
   );
 }
 
+const SOURCE_TABS: SourceKind[] = ['local', 'webdav', 'aliyun'];
+
 function AddSourceDialog({ onClose, onCreated }: { onClose: () => void; onCreated: () => Promise<void> }) {
   const [kind, setKind] = useState<SourceKind>('local');
   const [name, setName] = useState('');
@@ -965,6 +967,14 @@ function AddSourceDialog({ onClose, onCreated }: { onClose: () => void; onCreate
   const [err, setErr] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  const [qr, setQr] = useState<{ sessionId: string; dataUrl: string } | null>(null);
+  const [qrStatus, setQrStatus] = useState('');
+  const [qrBusy, setQrBusy] = useState(false);
+  const nameRef = useRef(name);
+  useEffect(() => {
+    nameRef.current = name;
+  }, [name]);
+
   const addLocal = async () => {
     try {
       const picked = await call<string[]>(IPC.pickDirectory);
@@ -973,6 +983,59 @@ function AddSourceDialog({ onClose, onCreated }: { onClose: () => void; onCreate
       setErr(e instanceof Error ? e.message : String(e));
     }
   };
+
+  const startQr = async () => {
+    setQrBusy(true);
+    setErr(null);
+    setQr(null);
+    setQrStatus('正在生成二维码…');
+    try {
+      const r = await call<{ sessionId: string; qrDataUrl: string }>(IPC.aliyunQrStart);
+      setQr({ sessionId: r.sessionId, dataUrl: r.qrDataUrl });
+      setQrStatus('等待扫码…');
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setQrStatus('');
+    } finally {
+      setQrBusy(false);
+    }
+  };
+
+  // 轮询扫码状态：确认后主进程已经建好源，这里只需刷新列表并关窗
+  useEffect(() => {
+    if (!qr) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    const tick = async () => {
+      try {
+        const r = await call<{ status: string }>(IPC.aliyunQrPoll, {
+          sessionId: qr.sessionId,
+          name: nameRef.current.trim() || undefined,
+        });
+        if (stopped) return;
+        if (r.status === 'NEW') setQrStatus('等待扫码…');
+        else if (r.status === 'SCANNED') setQrStatus('已扫码，请在手机上确认登录');
+        else if (r.status === 'EXPIRED') {
+          setQrStatus('二维码已过期，请点「重新生成二维码」');
+          if (timer) clearInterval(timer);
+        } else if (r.status === 'CONFIRMED') {
+          setQrStatus('授权成功，正在挂载…');
+          if (timer) clearInterval(timer);
+          await onCreated();
+        }
+      } catch (e) {
+        if (!stopped) setQrStatus(e instanceof Error ? e.message : String(e));
+      }
+    };
+
+    timer = setInterval(() => void tick(), 2000);
+    void tick();
+    return () => {
+      stopped = true;
+      if (timer) clearInterval(timer);
+    };
+  }, [qr, onCreated]);
 
   const submit = async () => {
     setSubmitting(true);
@@ -986,7 +1049,7 @@ function AddSourceDialog({ onClose, onCreated }: { onClose: () => void; onCreate
         if (!url.trim()) throw new Error('请填写 WebDAV 地址');
         config = { kind: 'webdav', url: url.trim(), username: user, password: pass, root: root.trim() || '/' };
       } else {
-        throw new Error('该网盘类型暂未接入，请用 Alist/OpenList 转成 WebDAV');
+        throw new Error('阿里云盘走扫码授权，不需要手动提交');
       }
       await call(IPC.sourcesCreate, {
         kind,
@@ -1006,8 +1069,15 @@ function AddSourceDialog({ onClose, onCreated }: { onClose: () => void; onCreate
       <div className="modal__panel" onClick={(e) => e.stopPropagation()}>
         <h2>添加存储源</h2>
         <div className="tabs">
-          {(['local', 'webdav'] as SourceKind[]).map((k) => (
-            <button key={k} className={`tab ${kind === k ? 'is-active' : ''}`} onClick={() => setKind(k)}>
+          {SOURCE_TABS.map((k) => (
+            <button
+              key={k}
+              className={`tab ${kind === k ? 'is-active' : ''}`}
+              onClick={() => {
+                setKind(k);
+                setErr(null);
+              }}
+            >
               {SOURCE_KIND_LABEL[k]}
             </button>
           ))}
@@ -1037,7 +1107,7 @@ function AddSourceDialog({ onClose, onCreated }: { onClose: () => void; onCreate
               </ul>
             </div>
           </>
-        ) : (
+        ) : kind === 'webdav' ? (
           <>
             <div className="field">
               <label>WebDAV 地址</label>
@@ -1057,17 +1127,39 @@ function AddSourceDialog({ onClose, onCreated }: { onClose: () => void; onCreate
               <small>密码用系统级加密（Windows DPAPI）保存，不落明文。</small>
             </div>
           </>
+        ) : (
+          <>
+            <div className="field">
+              <label>扫码授权</label>
+              <small>用<strong>阿里云盘 App</strong>扫描下方二维码，在手机上点确认，即可自动挂载到本应用。</small>
+              {qr ? (
+                <div className="qr-wrap">
+                  <img className="qr" src={qr.dataUrl} alt="阿里云盘登录二维码" />
+                </div>
+              ) : null}
+              <div className="qr-status">{qrStatus}</div>
+              <button className="btn btn--ghost" onClick={() => void startQr()} disabled={qrBusy}>
+                {qrBusy ? '生成中…' : qr ? '重新生成二维码' : '生成二维码'}
+              </button>
+              <small>
+                授权后的 access_token 与 refresh_token 都用系统级加密保存，只在本地用于调用阿里云盘接口。
+                若扫码后提示无法解析 token，说明官方接口结构已变，可改用 WebDAV（Alist）方式挂载。
+              </small>
+            </div>
+          </>
         )}
 
         {err ? <div className="error">{err}</div> : null}
 
         <div className="modal__actions">
           <button className="btn btn--ghost" onClick={onClose}>
-            取消
+            {kind === 'aliyun' ? '关闭' : '取消'}
           </button>
-          <button className="btn btn--primary" onClick={() => void submit()} disabled={submitting}>
-            {submitting ? '添加中…' : '添加'}
-          </button>
+          {kind === 'aliyun' ? null : (
+            <button className="btn btn--primary" onClick={() => void submit()} disabled={submitting}>
+              {submitting ? '添加中…' : '添加'}
+            </button>
+          )}
         </div>
       </div>
     </div>
