@@ -17,7 +17,9 @@
     "icon": "python scripts/make-icon.py",
     "vendor:mpv": "node scripts/vendor-mpv.mjs",
     "pack:dir": "npm run build && node scripts/vendor-mpv.mjs && electron-builder --win --x64 --dir",
-    "pack": "npm run build && node scripts/vendor-mpv.mjs && electron-builder --win --x64"
+    "pack": "npm run build && node scripts/vendor-mpv.mjs && electron-builder --win --x64",
+    "deploy": "node scripts/deploy-desktop.mjs --shortcut",
+    "pack:deploy": "npm run pack && node scripts/deploy-desktop.mjs --shortcut"
   },
   "build": {
     "appId": "com.nebula.mediaplayer",
