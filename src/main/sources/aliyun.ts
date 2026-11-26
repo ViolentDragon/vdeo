@@ -11,7 +11,12 @@ import { getDriveInfo, refreshToken, type AliyunToken } from './aliyun-auth';
  * 代价是「同目录字幕自动发现」拿不到父目录，本期对 aliyun 不做字幕自动匹配。
  */
 
-const OPENAPI = 'https://openapi.alipan.com';
+/**
+ * 用 Web 端 API（api.aliyundrive.com），不用开放平台（openapi.alipan.com）。
+ * passport 扫码与 refresh_token 换出来的都是 Web 会话 token，
+ * 调开放平台会回 TokenVerifyFailed: invalid access_token（实测日志已确认）。
+ */
+const WEB_API = 'https://api.aliyundrive.com';
 const PAGE_LIMIT = 200;
 const MAX_PAGES = 60;
 
@@ -62,7 +67,7 @@ export class AliyunProvider implements StorageProvider {
     await this.ensureFresh();
     let res: Response;
     try {
-      res = await fetch(OPENAPI + path, {
+      res = await fetch(WEB_API + path, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${this.token.accessToken}`,
@@ -130,7 +135,7 @@ export class AliyunProvider implements StorageProvider {
       const res = await this.api<{
         items?: Array<Record<string, unknown>>;
         next_marker?: string;
-      }>('/adrive/v1.0/openFile/list', body);
+      }>('/adrive/v3/file/list', body);
 
       for (const it of res.items ?? []) {
         const fileId = String(it['file_id'] ?? it['id'] ?? '');
@@ -166,7 +171,7 @@ export class AliyunProvider implements StorageProvider {
 
     // 1) 优先直链（需要该账号/token 具备下载权限，失败就换转码）
     try {
-      const dl = await this.api<{ url?: string }>('/adrive/v1.0/openFile/getDownloadUrl', {
+      const dl = await this.api<{ url?: string }>('/v2/file/get_download_url', {
         drive_id: this.config.driveId,
         file_id: fileId,
         expire_sec: 14400,
@@ -181,7 +186,7 @@ export class AliyunProvider implements StorageProvider {
       video_preview_play_info?: {
         live_transcoding_task_list?: Array<{ template_id?: string; url?: string }>;
       };
-    }>('/adrive/v1.0/openFile/getVideoPreviewPlayInfo', {
+    }>('/v2/file/get_video_preview_play_info', {
       drive_id: this.config.driveId,
       file_id: fileId,
       category: 'live_transcoding',

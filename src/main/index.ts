@@ -561,19 +561,22 @@ function registerIpc(): void {
     // bizExt 里的 accessToken 很可能只是 passport 会话 token，直接拿来调 openapi 会得到
     // TokenVerifyFailed: invalid access_token（实测）。正确做法是先用 refresh_token
     // 走标准 OAuth 换一次 PDS 的 access_token，再调 getDriveInfo。
+    // 分两步、分别记录：此前把 refresh 与 getDriveInfo 放在同一个 try 里，
+    // 实际失败在后者，日志却写成「refresh 换取失败」，把排查方向带偏了。
     let token: AliyunToken = res.token;
-    let drive: DriveInfo;
     try {
       token = await refreshToken(res.token.refreshToken);
-      drive = await getDriveInfo(token.accessToken);
-      log('[aliyun] 已用 refresh_token 换取 access_token，drive_id =', drive.driveId);
+      log('[aliyun] refresh_token 换取成功，expiresAt =', token.expiresAt);
     } catch (refreshErr) {
-      log('[aliyun] refresh 换取失败，退回 bizExt accessToken：', refreshErr instanceof Error ? refreshErr.message : String(refreshErr));
-      // 兜底必须回到 bizExt 的原始 token：上一行可能已把 token 覆盖成 refresh 结果，
-      // 若失败发生在 getDriveInfo 阶段，再拿同一个新 token 调一次只会重复失败。
+      log('[aliyun] refresh 换取失败，改用 bizExt accessToken：', refreshErr instanceof Error ? refreshErr.message : String(refreshErr));
       token = res.token;
-      drive = await getDriveInfo(token.accessToken);
     }
+
+    const drive = await getDriveInfo(token.accessToken).catch((driveErr: unknown) => {
+      log('[aliyun] getDriveInfo 失败：', driveErr instanceof Error ? driveErr.message : String(driveErr));
+      throw driveErr;
+    });
+    log('[aliyun] 挂载成功，drive_id =', drive.driveId, '网盘：', drive.driveName);
 
     const config: AliyunSourceConfig = {
       kind: 'aliyun',

@@ -275,27 +275,38 @@ export interface DriveInfo {
   totalSize: number;
 }
 
-/** 调 openapi 校验 token 并拿到默认网盘信息 */
+/**
+ * 取默认网盘信息。
+ *
+ * 必须用 Web 端 API（api.aliyundrive.com），不能用开放平台（openapi.alipan.com）：
+ * passport 扫码与 refresh_token 换出来的都是 Web 会话 token，开放平台接口会回
+ * TokenVerifyFailed: invalid access_token（实测，已由日志确认）。
+ */
 export async function getDriveInfo(accessToken: string): Promise<DriveInfo> {
-  const json = (await getJson(`${OPENAPI}/adrive/v1.0/user/getDriveInfo`, {
+  const json = (await getJson('https://api.aliyundrive.com/v2/user/get', {
     method: 'POST',
     headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
     body: '{}',
   })) as Record<string, unknown>;
 
   const driveId =
-    (typeof json['resource_drive_id'] === 'string' && json['resource_drive_id']) ||
     (typeof json['default_drive_id'] === 'string' && json['default_drive_id']) ||
+    (typeof json['resource_drive_id'] === 'string' && json['resource_drive_id']) ||
     (typeof json['backup_drive_id'] === 'string' && json['backup_drive_id']) ||
     '';
   if (!driveId) {
-    throw new Error(`无法获取阿里云盘 drive_id：${JSON.stringify(json).slice(0, 200)}`);
+    throw new Error(`无法获取阿里云盘 drive_id：${JSON.stringify(json).slice(0, 240)}`);
   }
+
   const toNum = (v: unknown): number => (typeof v === 'number' ? v : Number.isFinite(Number(v)) ? Number(v) : 0);
+  const space = (json['space_info'] ?? {}) as Record<string, unknown>;
   return {
     driveId,
-    driveName: typeof json['drive_name'] === 'string' ? json['drive_name'] : '阿里云盘',
-    usedSize: toNum(json['used_size']),
-    totalSize: toNum(json['total_size']),
+    driveName:
+      (typeof json['nick_name'] === 'string' && json['nick_name']) ||
+      (typeof json['user_name'] === 'string' && json['user_name']) ||
+      '阿里云盘',
+    usedSize: toNum(space['used_size']),
+    totalSize: toNum(space['total_size']),
   };
 }
