@@ -158,7 +158,59 @@ export class AliyunProvider implements StorageProvider {
     }
 
     log(`[aliyun] 所有盘在 parent=${parentId} 下均为空（共试 ${drives.length} 个盘）`);
+    // 只在根目录探测，避免递归时对每个子目录都跑一遍
+    if (parentId === 'root' || parentId === this.config.root) {
+      await this.probeMatrix(parentId);
+    }
     return [];
+  }
+
+  /**
+   * 当所有盘都返回 0 项时，跑一次诊断矩阵并写日志。
+   *
+   * 目的：一次性区分「盘真的空」与「参数组合不对」。之前只知道 'root' 返回空，
+   * 没试过 '0'、空串、数字型 drive_id，也没验证过 openapi 域名下的 getDriveInfo
+   * 在真实 token 下是什么反应——这些信息缺失导致无法定位。
+   */
+  private async probeMatrix(parentId: string): Promise<void> {
+    const drives = await this.driveCandidates();
+    const driveId = drives[0] ?? this.config.driveId;
+    if (!driveId) return;
+
+    const variants: Array<{ name: string; body: Record<string, unknown> }> = [
+      { name: 'parent=root', body: { drive_id: driveId, parent_file_id: 'root', limit: 20, fields: '*' } },
+      { name: "parent='0'", body: { drive_id: driveId, parent_file_id: '0', limit: 20, fields: '*' } },
+      { name: "parent=''", body: { drive_id: driveId, parent_file_id: '', limit: 20, fields: '*' } },
+      { name: 'drive_id 为数字', body: { drive_id: Number(driveId) || driveId, parent_file_id: 'root', limit: 20, fields: '*' } },
+    ];
+
+    for (const v of variants) {
+      try {
+        const r = await this.api<{ items?: unknown[] }>('/adrive/v3/file/list', v.body);
+        log(`[aliyun][探测] ${v.name} → ${r.items?.length ?? 0} 项`);
+      } catch (err) {
+        log(`[aliyun][探测] ${v.name} 失败:`, err instanceof Error ? err.message.slice(0, 120) : String(err));
+      }
+    }
+
+    // 对照：开放平台的 getDriveInfo 在真实 token 下的反应
+    // （据此判断是否需要 OAuth token，而不是继续猜）
+    try {
+      const res = await fetch('https://openapi.alipan.com/adrive/v1.0/user/getDriveInfo', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.token.accessToken}`,
+          'Content-Type': 'application/json',
+          'User-Agent': UA,
+        },
+        body: '{}',
+        signal: AbortSignal.timeout(15000),
+      });
+      const text = await res.text();
+      log(`[aliyun][探测] openapi getDriveInfo → HTTP ${res.status}`, text.slice(0, 160));
+    } catch (err) {
+      log('[aliyun][探测] openapi getDriveInfo 请求失败:', err instanceof Error ? err.message.slice(0, 120) : String(err));
+    }
   }
 
   private async listFromDrive(driveId: string, parentId: string): Promise<RemoteEntry[]> {
