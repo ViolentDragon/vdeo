@@ -541,6 +541,9 @@ function registerIpc(): void {
       log('[aliyun] 已用 refresh_token 换取 access_token，drive_id =', drive.driveId);
     } catch (refreshErr) {
       log('[aliyun] refresh 换取失败，退回 bizExt accessToken：', refreshErr instanceof Error ? refreshErr.message : String(refreshErr));
+      // 兜底必须回到 bizExt 的原始 token：上一行可能已把 token 覆盖成 refresh 结果，
+      // 若失败发生在 getDriveInfo 阶段，再拿同一个新 token 调一次只会重复失败。
+      token = res.token;
       drive = await getDriveInfo(token.accessToken);
     }
 
