@@ -248,11 +248,50 @@ export interface ScanSummary {
 
 /* ------------------------------ 应用设置 ------------------------------ */
 
+/** 播放引擎选择 */
+export type PlayerEngine = 'builtin' | 'external' | 'auto';
+
+/**
+ * 播放器配置。
+ * builtin  = 只用应用内置的 mpv（不可用时明确报错，不偷偷换）
+ * external = 只用外部播放器
+ * auto     = 内置优先，内置不可用再回落外部，最后退到系统默认程序
+ */
+export interface PlayerConfig {
+  engine: PlayerEngine;
+  /** 预设 id（EXTERNAL_PLAYER_PRESETS 之一），'custom' 表示用 externalPath */
+  externalId: string;
+  /** externalId === 'custom' 时使用的可执行文件路径 */
+  externalPath: string;
+  /** 参数模板，支持 {url} {title} {start} 占位符 */
+  externalArgs: string;
+  /** 传给内置 mpv 的附加命令行参数（空格分隔，支持引号） */
+  builtinArgs: string;
+}
+
+export const DEFAULT_PLAYER_CONFIG: PlayerConfig = {
+  engine: 'auto',
+  externalId: 'system',
+  externalPath: '',
+  externalArgs: '{url}',
+  builtinArgs: '',
+};
+
+/** 外部播放器探测结果（渲染层用于下拉展示） */
+export interface ExternalPlayerInfo {
+  id: string;
+  name: string;
+  /** 探测到的可执行路径；null 表示未安装 */
+  path: string | null;
+  defaultArgs: string;
+  /** 系统默认打开方式（无需可执行文件） */
+  system: boolean;
+}
+
 export interface AppSettings {
+  /** 自定义 mpv 路径；null 表示自动探测（内置优先） */
   mpvPath: string | null;
-  /** 用于 fallback 的外部播放器命令模板，{url} 占位 */
-  externalPlayer: string | null;
-  preferredMode: PlayerMode;
+  player: PlayerConfig;
   theme: 'dark' | 'dark-blue' | 'midnight';
   /** 扫描时忽略的目录名片段 */
   ignorePatterns: string[];

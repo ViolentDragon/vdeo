@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  DEFAULT_PLAYER_CONFIG,
   SECTION_LABEL,
   SOURCE_KIND_LABEL,
   type AppSettings,
   type BrowseResult,
+  type ExternalPlayerInfo,
   type LibrarySection,
   type MediaItem,
+  type PlayerConfig,
+  type PlayerEngine,
   type PlayerState,
   type ScanProgress,
   type SeriesSummary,
@@ -728,6 +732,18 @@ function SourcesPanel({
   );
 }
 
+type PlayerDetectResult = {
+  mpv: { path: string | null; source: string; message: string };
+  external: ExternalPlayerInfo[];
+  player: PlayerConfig;
+};
+
+const ENGINE_OPTIONS: Array<{ value: PlayerEngine; label: string; hint: string }> = [
+  { value: 'auto', label: '自动', hint: '内置 mpv 优先，不可用时回落外部播放器' },
+  { value: 'builtin', label: '仅内置 mpv', hint: '不可用时明确报错，不静默替换' },
+  { value: 'external', label: '仅外部播放器', hint: '始终交给外部程序' },
+];
+
 function SettingsPanel({
   settings,
   onSave,
@@ -735,57 +751,197 @@ function SettingsPanel({
   settings: AppSettings | null;
   onSave: (patch: Partial<AppSettings>) => Promise<void>;
 }) {
-  const [mpv, setMpv] = useState(settings?.mpvPath ?? '');
-  const [ext, setExt] = useState(settings?.externalPlayer ?? '');
+  const [mpvPath, setMpvPath] = useState(settings?.mpvPath ?? '');
   const [hwdec, setHwdec] = useState(settings?.hardwareDecode ?? true);
+  const [player, setPlayer] = useState<PlayerConfig>(settings?.player ?? DEFAULT_PLAYER_CONFIG);
+  const [detected, setDetected] = useState<PlayerDetectResult | null>(null);
+  const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
-    setMpv(settings?.mpvPath ?? '');
-    setExt(settings?.externalPlayer ?? '');
+    setMpvPath(settings?.mpvPath ?? '');
     setHwdec(settings?.hardwareDecode ?? true);
+    setPlayer(settings?.player ?? DEFAULT_PLAYER_CONFIG);
   }, [settings]);
+
+  const detect = useCallback(async () => {
+    try {
+      const r = await call<PlayerDetectResult>(IPC.playersDetect);
+      setDetected(r);
+    } catch (err) {
+      setTestMsg({ ok: false, text: err instanceof Error ? err.message : String(err) });
+    }
+  }, []);
+
+  useEffect(() => {
+    void detect();
+  }, [detect]);
+
+  const save = async (alsoTest: boolean) => {
+    await onSave({ mpvPath: mpvPath.trim() ? mpvPath.trim() : null, hardwareDecode: hwdec, player });
+    if (alsoTest) {
+      try {
+        const r = await call<{ ok: boolean; message: string }>(IPC.playersTest);
+        setTestMsg({ ok: r.ok, text: r.message });
+      } catch (err) {
+        setTestMsg({ ok: false, text: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  };
+
+  const currentExternal = detected?.external.find((d) => d.id === player.externalId);
 
   return (
     <section className="panel">
       <div className="panel__head">
-        <h2>设置</h2>
+        <h2>播放</h2>
       </div>
+
       <div className="field">
-        <label>mpv 路径</label>
+        <label>播放方式</label>
+        <div className="radio-row">
+          {ENGINE_OPTIONS.map((opt) => (
+            <label key={opt.value} className={`radio ${player.engine === opt.value ? 'is-active' : ''}`}>
+              <input
+                type="radio"
+                name="player-engine"
+                checked={player.engine === opt.value}
+                onChange={() => setPlayer((p) => ({ ...p, engine: opt.value }))}
+              />
+              <span className="radio__label">{opt.label}</span>
+              <small className="radio__hint">{opt.hint}</small>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div className="field">
+        <label>内置 mpv</label>
+        <div className="status-line">
+          {detected?.mpv.path ? (
+            <span className="status status--ok">✓ {detected.mpv.message}</span>
+          ) : (
+            <span className="status status--warn">! {detected?.mpv.message ?? '检测中…'}</span>
+          )}
+        </div>
         <input
           className="input"
-          placeholder="留空则自动探测（PATH / 常见安装位置）"
-          value={mpv}
-          onChange={(e) => setMpv(e.target.value)}
+          placeholder="留空则自动探测（内置 → PATH → 常见安装位置）"
+          value={mpvPath}
+          onChange={(e) => setMpvPath(e.target.value)}
         />
-        <small>内嵌播放依赖 mpv。未安装时可用下面的外部播放器。</small>
+        <small>打包版已内置 mpv，通常不需要填写。填写后优先于内置版本。</small>
       </div>
+
       <div className="field">
-        <label>外部播放器命令</label>
+        <label>mpv 附加参数</label>
         <input
           className="input"
-          placeholder="例：C:\\Program Files\\DAUM\\PotPlayer\\PotPlayerMini64.exe 或 vlc"
-          value={ext}
-          onChange={(e) => setExt(e.target.value)}
+          placeholder="例：--profile=low-latency --hwdec=auto"
+          value={player.builtinArgs}
+          onChange={(e) => setPlayer((p) => ({ ...p, builtinArgs: e.target.value }))}
         />
-        <small>把视频地址作为最后一个参数传入。留空则用系统默认程序打开。</small>
+        <small>空格分隔，支持引号。修改后下次播放生效。</small>
       </div>
+
+      <div className="field">
+        <label>外部播放器</label>
+        <select
+          className="select select--full"
+          value={player.externalId}
+          onChange={(e) => {
+            const id = e.target.value;
+            const preset = detected?.external.find((d) => d.id === id);
+            setPlayer((p) => ({ ...p, externalId: id, externalArgs: preset?.defaultArgs ?? p.externalArgs }));
+          }}
+        >
+          {(detected?.external ?? []).map((d) => (
+            <option key={d.id} value={d.id}>
+              {d.name}
+              {d.system ? '' : d.path ? ' ✓ 已安装' : ' （未检测到）'}
+            </option>
+          ))}
+        </select>
+        <div className="status-line">
+          {currentExternal && !currentExternal.system ? (
+            currentExternal.path ? (
+              <span className="status status--ok">✓ {currentExternal.path}</span>
+            ) : (
+              <span className="status status--warn">! 未检测到，可改用「自定义…」手动指定</span>
+            )
+          ) : (
+            <span className="status">交给系统默认程序打开</span>
+          )}
+        </div>
+        {player.externalId === 'custom' ? (
+          <div className="row">
+            <input
+              className="input"
+              placeholder="播放器可执行文件完整路径"
+              value={player.externalPath}
+              onChange={(e) => setPlayer((p) => ({ ...p, externalPath: e.target.value }))}
+            />
+            <button
+              className="btn btn--ghost"
+              onClick={async () => {
+                try {
+                  const picked = await call<string | null>(IPC.pickExecutable);
+                  if (picked) setPlayer((p) => ({ ...p, externalPath: picked }));
+                } catch {
+                  /* 用户取消 */
+                }
+              }}
+            >
+              浏览…
+            </button>
+          </div>
+        ) : null}
+      </div>
+
+      <div className="field">
+        <label>参数模板</label>
+        <input
+          className="input"
+          placeholder='"{url}"'
+          value={player.externalArgs}
+          onChange={(e) => setPlayer((p) => ({ ...p, externalArgs: e.target.value }))}
+        />
+        <small>
+          占位符：{'>{url}<'} 视频地址、{'>{title}<'} 标题、{'>{start}<'} 续播起点秒数。带空格的路径用引号包住。
+        </small>
+      </div>
+
       <div className="field field--row">
-        <label>硬件解码</label>
+        <label>硬件解码（内置 mpv）</label>
         <input type="checkbox" checked={hwdec} onChange={(e) => setHwdec(e.target.checked)} />
       </div>
-      <button
-        className="btn btn--primary"
-        onClick={() =>
-          void onSave({
-            mpvPath: mpv.trim() ? mpv.trim() : null,
-            externalPlayer: ext.trim() ? ext.trim() : null,
-            hardwareDecode: hwdec,
-          })
-        }
-      >
-        保存设置
-      </button>
+
+      <div className="row">
+        <button className="btn btn--primary" onClick={() => void save(false)}>
+          保存设置
+        </button>
+        <button className="btn btn--ghost" onClick={() => void save(true)}>
+          保存并测试
+        </button>
+        <button className="btn btn--ghost" onClick={() => void detect()}>
+          重新检测
+        </button>
+      </div>
+
+      {testMsg ? (
+        <div className={testMsg.ok ? 'status status--ok' : 'error'} style={{ marginTop: 12 }}>
+          {testMsg.text}
+        </div>
+      ) : null}
+
+      <div className="panel__note">
+        <h3>关于播放器</h3>
+        <p>
+          内置 mpv 随安装包分发（<code>resources/mpv/mpv.exe</code>），不需要单独安装。外部播放器会自动探测 PotPlayer、VLC、
+          MPC-HC、MPC-BE 与系统 mpv 的常见安装位置；没装就明确报错，不会静默换成别的播放器。
+        </p>
+        <p>音频与图片始终交给外部程序打开，不走 mpv 的播放流程。</p>
+      </div>
+
       <div className="panel__note">
         <h3>关于网盘接入</h3>
         <p>

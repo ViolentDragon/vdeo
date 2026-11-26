@@ -1,8 +1,9 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from 'electron';
 import { join, dirname } from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { initLogger, log } from './logger';
 import { IPC, type Rpc } from '../shared/ipc-contract';
+import { DEFAULT_PLAYER_CONFIG } from '../shared/types';
 import type {
   AppSettings,
   BrowseQuery,
@@ -20,7 +21,8 @@ import { encryptSecret } from './sources/secrets';
 import { parentOf, type StorageProvider } from './sources/types';
 import { scanSource } from './scan/scanner';
 import { AUDIO_EXTS, IMAGE_EXTS, SUBTITLE_EXTS, VIDEO_EXTS } from './scan/namer';
-import { locateMpv, resolveExternalCommand } from './player/locate';
+import { locateMpv } from './player/locate';
+import { detectExternalPlayers, migrateLegacyCommand, resolveExternalLaunch, splitArgs } from './player/external';
 import { MpvController } from './player/mpv';
 
 let win: BrowserWindow | null = null;
@@ -32,8 +34,7 @@ const scanning = new Map<string, AbortController>();
 
 const DEFAULT_SETTINGS: AppSettings = {
   mpvPath: null,
-  externalPlayer: null,
-  preferredMode: 'embedded',
+  player: { ...DEFAULT_PLAYER_CONFIG },
   theme: 'dark',
   ignorePatterns: ['$RECYCLE.BIN', 'System Volume Information', '@eaDir', '#recycle', '.Trash'],
   videoExtensions: [...VIDEO_EXTS],
@@ -65,9 +66,33 @@ function handle<TIn, TOut>(channel: string, fn: (payload: TIn) => Promise<TOut> 
   });
 }
 
+type LegacyPlayerFields = { externalPlayer?: unknown; preferredMode?: unknown };
+
 function loadSettings(): AppSettings {
-  const stored = repo.getAllSettings();
-  return { ...DEFAULT_SETTINGS, ...stored, cacheDir: stored.cacheDir || join(app.getPath('userData'), 'cache') };
+  const stored = repo.getAllSettings() as Partial<AppSettings> & LegacyPlayerFields;
+  const merged: AppSettings = {
+    ...DEFAULT_SETTINGS,
+    ...stored,
+    player: { ...DEFAULT_PLAYER_CONFIG, ...(stored.player ?? {}) },
+    cacheDir: stored.cacheDir || join(app.getPath('userData'), 'cache'),
+  };
+
+  // 旧版把外部播放器存成一整条命令字符串（externalPlayer），还有一个从未被读取的
+  // preferredMode。这里做一次性迁移，避免老用户升级后配置丢失。
+  const legacyCommand = typeof stored.externalPlayer === 'string' ? stored.externalPlayer.trim() : '';
+  if (!stored.player && (legacyCommand || stored.preferredMode)) {
+    const migrated = legacyCommand ? migrateLegacyCommand(legacyCommand) : {};
+    merged.player = {
+      ...DEFAULT_PLAYER_CONFIG,
+      engine: stored.preferredMode === 'external' ? 'external' : 'auto',
+      ...migrated,
+    };
+  }
+
+  const raw = merged as unknown as Record<string, unknown>;
+  delete raw['externalPlayer'];
+  delete raw['preferredMode'];
+  return merged;
 }
 
 function requireSource(id: string): StorageSource {
@@ -186,6 +211,7 @@ async function ensureController(): Promise<MpvController> {
     mpvPath,
     hardwareDecode: settings.hardwareDecode,
     wid: null,
+    extraArgs: splitArgs(settings.player?.builtinArgs ?? ''),
   });
   c.on('state', (state: unknown) => {
     broadcast(IPC.evPlayer, state);
@@ -196,41 +222,15 @@ async function ensureController(): Promise<MpvController> {
   return c;
 }
 
-async function handlePlay(itemId: string): Promise<{ mode: 'mpv' | 'external'; message: string }> {
-  const item = requireItem(itemId);
-  const source = requireSource(item.sourceId);
-  const provider = createProvider(source);
-  const resolved = await provider.resolvePlayUrl(item.path);
-  const record = repo.getPlayback(item.id);
-  const startAt = record && !record.finished && record.position > 5 ? record.position : 0;
-
-  if (!isVideo(item)) {
-    if (AUDIO_EXTS.has(item.ext) || IMAGE_EXTS.has(item.ext)) {
-      const ext = resolveExternalCommand(settings.externalPlayer);
-      if (ext) {
-        const { spawn } = await import('node:child_process');
-        spawn(ext.cmd, ext.args(resolved.url), { detached: true, stdio: 'ignore' }).unref();
-        return { mode: 'external', message: '已交给外部播放器' };
-      }
-      await shell.openPath(resolved.url);
-      return { mode: 'external', message: '已用系统默认程序打开' };
-    }
-    throw new Error(`不支持的媒体类型：.${item.ext}`);
-  }
-
-  if (!mpvPath) {
-    const ext = resolveExternalCommand(settings.externalPlayer);
-    if (ext) {
-      const { spawn } = await import('node:child_process');
-      spawn(ext.cmd, ext.args(resolved.url), { detached: true, stdio: 'ignore' }).unref();
-      return { mode: 'external', message: '未找到 mpv，已交给配置的外部播放器' };
-    }
-    await shell.openPath(resolved.url);
-    return { mode: 'external', message: '未找到 mpv，已用系统默认播放器打开' };
-  }
-
+async function playWithBuiltin(
+  provider: StorageProvider,
+  item: MediaItem,
+  sourceKind: SourceKind,
+  resolved: { url: string; headers: Record<string, string> },
+  startAt: number,
+): Promise<string> {
   const c = await ensureController();
-  const subtitles = await findSubtitles(provider, item, source.kind);
+  const subtitles = await findSubtitles(provider, item, sourceKind);
   await c.play({
     itemId: item.id,
     url: resolved.url,
@@ -239,7 +239,66 @@ async function handlePlay(itemId: string): Promise<{ mode: 'mpv' | 'external'; m
     startAt,
     subtitles,
   });
-  return { mode: 'mpv', message: '使用 mpv 播放' };
+  return '使用内置 mpv 播放';
+}
+
+/** 交给外部播放器；配置为「系统默认程序」时 cmd 为 null */
+async function playWithExternal(
+  item: MediaItem,
+  resolved: { url: string; headers: Record<string, string> },
+  startAt: number,
+): Promise<string> {
+  const plan = resolveExternalLaunch(settings.player, detectExternalPlayers(), {
+    url: resolved.url,
+    title: item.seriesTitle ?? item.title,
+    start: startAt,
+  });
+  if (!plan.ok) throw new Error(plan.error);
+  if (plan.launch.cmd === null) {
+    await shell.openPath(resolved.url);
+    return '已用系统默认程序打开';
+  }
+  const { spawn } = await import('node:child_process');
+  spawn(plan.launch.cmd, plan.launch.args, { detached: true, stdio: 'ignore' }).unref();
+  return `已交给外部播放器：${plan.launch.cmd}`;
+}
+
+async function handlePlay(itemId: string): Promise<{ mode: 'mpv' | 'external'; message: string }> {
+  const item = requireItem(itemId);
+  const source = requireSource(item.sourceId);
+  const provider = createProvider(source);
+  const resolved = await provider.resolvePlayUrl(item.path);
+  const record = repo.getPlayback(item.id);
+  const startAt = record && !record.finished && record.position > 5 ? record.position : 0;
+
+  const engine = settings.player?.engine ?? 'auto';
+
+  // 音频/图片不进 mpv 的播放流程，始终交给外部程序
+  if (!isVideo(item)) {
+    if (AUDIO_EXTS.has(item.ext) || IMAGE_EXTS.has(item.ext)) {
+      return { mode: 'external', message: await playWithExternal(item, resolved, startAt) };
+    }
+    throw new Error(`不支持的媒体类型：.${item.ext}`);
+  }
+
+  if (engine === 'builtin') {
+    if (!mpvPath) {
+      throw new Error(
+        '播放方式设为「仅内置 mpv」，但没找到 mpv。请在设置里指定 mpv.exe 路径，或把播放方式改成「外部播放器」/「自动」。',
+      );
+    }
+    return { mode: 'mpv', message: await playWithBuiltin(provider, item, source.kind, resolved, startAt) };
+  }
+
+  if (engine === 'external') {
+    return { mode: 'external', message: await playWithExternal(item, resolved, startAt) };
+  }
+
+  // auto：内置优先，不可用再回落外部
+  if (mpvPath) {
+    return { mode: 'mpv', message: await playWithBuiltin(provider, item, source.kind, resolved, startAt) };
+  }
+  return { mode: 'external', message: `未找到 mpv，${await playWithExternal(item, resolved, startAt)}` };
 }
 
 function fmtEpisode(item: MediaItem): string {
@@ -302,6 +361,42 @@ function createWindow(): void {
     console.error(`[preload] 加载失败 ${path}: ${err.message}`);
   });
 
+  // 调试能力（已文档化，不属于临时探针）：
+  //   NEBULA_CAPTURE=<png路径>            加载后截图
+  //   NEBULA_CAPTURE_VIEW=<导航文字>     截图前先切到该页面（如「设置」）
+  // 用途：打包后的 GUI 没有 DevTools，这是确认 UI 真实渲染的唯一可靠途径。
+  const captureTarget = process.env['NEBULA_CAPTURE'];
+  if (captureTarget) {
+    win.webContents.once('did-finish-load', () => {
+      setTimeout(() => {
+        const view = process.env['NEBULA_CAPTURE_VIEW'];
+        const switchView = view
+          ? win?.webContents
+              .executeJavaScript(
+                `(() => {
+                  const items = [...document.querySelectorAll('.nav__item')];
+                  const hit = items.find((el) => el.textContent && el.textContent.includes(${JSON.stringify(view)}));
+                  if (hit) hit.click();
+                  return Boolean(hit);
+                })()`,
+              )
+              .catch(() => false)
+          : Promise.resolve(false);
+        void switchView.then(() => {
+          setTimeout(() => {
+            void win?.webContents
+              .capturePage()
+              .then((img) => {
+                writeFileSync(captureTarget, img.toPNG());
+                log('[ui] 截图已保存', captureTarget);
+              })
+              .catch((err: unknown) => log('[ui] 截图失败', err));
+          }, 700);
+        });
+      }, 2200);
+    });
+  }
+
 
   const devUrl = process.env['VITE_DEV_SERVER_URL'];
   if (devUrl) {
@@ -335,10 +430,10 @@ function registerIpc(): void {
   handle(IPC.settingsUpdate, async (patch: Partial<AppSettings>) => {
     settings = { ...settings, ...patch };
     for (const [k, v] of Object.entries(patch)) repo.setSetting(k, v);
-    if (patch.mpvPath !== undefined || patch.hardwareDecode !== undefined) {
+    if (patch.mpvPath !== undefined || patch.hardwareDecode !== undefined || patch.player !== undefined) {
       const located = await locateMpv(settings.mpvPath);
       mpvPath = located.path;
-      // mpv 路径或硬解设置变化后旧进程参数已失效，销毁让下次播放按新配置重建
+      // mpv 路径、硬解或内置参数变化后旧进程参数已失效，销毁让下次播放按新配置重建
       controller?.dispose();
       controller = null;
     }
@@ -349,6 +444,41 @@ function registerIpc(): void {
     const located = await locateMpv(settings.mpvPath);
     mpvPath = located.path;
     return located;
+  });
+
+  handle(IPC.playersDetect, async () => {
+    const mpv = await locateMpv(settings.mpvPath);
+    mpvPath = mpv.path;
+    return { mpv, external: detectExternalPlayers(), player: settings.player };
+  });
+
+  // 只做「能否解析到可执行文件」的校验，不真的开播放器：测试按钮不应该弹窗
+  handle(IPC.playersTest, async () => {
+    const engine = settings.player?.engine ?? 'auto';
+    const mpv = await locateMpv(settings.mpvPath);
+    mpvPath = mpv.path;
+    if (engine === 'builtin' || (engine === 'auto' && mpv.path)) {
+      return mpv.path
+        ? { ok: true, message: `内置 mpv 可用：${mpv.path}` }
+        : { ok: false, message: mpv.message };
+    }
+    const plan = resolveExternalLaunch(settings.player, detectExternalPlayers(), { url: 'sample.mp4' });
+    if (!plan.ok) return { ok: false, message: plan.error };
+    return {
+      ok: true,
+      message: plan.launch.cmd
+        ? `外部播放器可用：${plan.launch.cmd}，参数 ${JSON.stringify(plan.launch.args)}`
+        : '将交给系统默认程序打开',
+    };
+  });
+
+  handle(IPC.pickExecutable, async () => {
+    const res = await dialog.showOpenDialog({
+      properties: ['openFile'],
+      title: '选择播放器可执行文件',
+      filters: process.platform === 'win32' ? [{ name: '可执行文件', extensions: ['exe'] }] : [],
+    });
+    return res.canceled ? null : (res.filePaths[0] ?? null);
   });
 
   handle(IPC.pickDirectory, async () => {

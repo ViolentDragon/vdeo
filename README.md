@@ -17,7 +17,8 @@
 | 文件名解析归类（电影/剧集/动漫/季集/技术标签） | 可用 | 13 条单测 |
 | 剧集按剧名聚合、季/集排序 | 可用 | 端到端测试 |
 | 播放进度记录 / 继续观看 | 可用 | 单测 |
-| mpv 进程管理与 IPC 控制（播放/暂停/进度/音量/音轨/字幕/倍速） | 已实现，**未在真实 mpv 上验证** | 本机未安装 mpv |
+| mpv 进程管理与 IPC 控制（播放/暂停/进度/音量/音轨/字幕/倍速） | 可用 | 真实 mpv v0.42.0 集成测试：启动→加载→时长→seek→暂停 |
+| 外部播放器（PotPlayer/VLC/MPC-HC/MPC-BE/自定义） | 可用 | 命令解析与启动解析 18 条单测 |
 | 外部播放器 / 系统默认播放器 | 已实现，未实测 | — |
 | 海报/元数据刮削（TMDB 等） | **未实现** | 当前海报位为占位渐变 |
 
@@ -54,11 +55,54 @@ npm run typecheck               # 主进程与渲染层分别做类型检查
 
 数据位置：`%APPDATA%/Nebula/nebula.db`（SQLite，与会话/缓存同目录）。
 
-### mpv
+### 内置 mpv
 
-播放依赖 [mpv](https://mpv.io)。安装方式任选：`choco install mpv`，或下载便携版后在「设置」里指定 `mpv.exe` 路径，或放进 PATH。
+`resources/mpv/mpv.exe` 随安装包分发（v0.42.0，来自 shinchiro/mpv-winbuild-cmake），**用户不需要自己装**。
 
-未找到 mpv 时应用仍可运行：会降级到「外部播放器」，或用系统默认程序打开文件。
+探测顺序（`src/main/player/locate.ts`）：用户配置 > 内置 > PATH > 常见安装位置。内置优先于 PATH 是刻意的——避免用户机器上的旧版本盖掉随包分发的版本。
+
+更新内置 mpv：
+
+```bash
+npm run vendor:mpv              # 下载并解压到 vendor/mpv（有缓存，可重复跑）
+npm run vendor:mpv -- --force   # 强制重新下载解压
+```
+
+### 外部播放器
+
+设置页「播放方式」三选一：
+
+| 方式 | 行为 |
+|---|---|
+| 自动（默认） | 内置 mpv 优先，不可用时回落外部播放器 |
+| 仅内置 mpv | 只用 mpv；不可用时**明确报错**，不静默替换 |
+| 仅外部播放器 | 始终交给外部程序 |
+
+外部播放器自动探测 PotPlayer、VLC、MPC-HC、MPC-BE、系统 mpv 的常见安装位置（`src/main/player/external.ts` 的 `EXTERNAL_PLAYER_PRESETS`），也可选「自定义…」手动指定 exe。
+
+参数模板占位符：
+
+| 占位符 | 含义 |
+|---|---|
+| `{url}` | 视频地址（本地路径或网盘直链） |
+| `{title}` | 标题 |
+| `{start}` | 续播起点秒数 |
+
+带空格的路径用引号包住，例如 `--start={start} "{url}"`。命令解析是引号感知的，`"C:\Program Files\VLC\vlc.exe"` 这类路径不会被拆碎。
+
+音频与图片始终交给外部程序，不走 mpv。
+
+### 调试：无 DevTools 环境截图
+
+打包后的 GUI 没有控制台与 DevTools，确认 UI 是否真的渲染靠这个开关：
+
+```bash
+NEBULA_CAPTURE=D:/shot.png NEBULA_CAPTURE_VIEW=设置 Nebula.exe
+```
+
+`NEBULA_CAPTURE_VIEW` 填侧边栏文字（如 `设置`、`电影`），截图前会先切到该页面。
+
+主进程日志在 `%APPDATA%/Nebula/logs/main.log`。
 
 ## 目录结构
 
@@ -82,7 +126,7 @@ WebDAV 密码用 Electron `safeStorage` 加密后落库（Windows 走 DPAPI，�
 
 ## 已知限制
 
-- **mpv 播放未在真实 mpv 上验证**：本机无 mpv 二进制，IPC 协议按 mpv 规范实现，需装 mpv 后实测。
+- mpv 播放已在真实 mpv v0.42.0 上验证（集成测试）；但**内嵌画面未合成进应用窗口**，mpv 以自己的窗口播放。
 - **内嵌视频未做窗口内合成**：mpv 以自身窗口播放（`--wid` 嵌入已预留参数），UI 控制条在主窗口底部。真正的"画面嵌进应用窗口"需要原生子窗口或 libmpv（需编译工具链）。
 - 无海报刮削、无演员/简介元数据。
 - 扫描为全量重扫 + `missing` 标记，未用 mtime/size 做差量跳过。

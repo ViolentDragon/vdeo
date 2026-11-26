@@ -6,6 +6,10 @@ export const IPC = {
   settingsUpdate: 'settings:update',
   mpvLocate: 'mpv:locate',
   pickDirectory: 'app:pick-directory',
+  pickExecutable: 'app:pick-executable',
+
+  playersDetect: 'players:detect',
+  playersTest: 'players:test',
 
   sourcesList: 'sources:list',
   sourcesCreate: 'sources:create',

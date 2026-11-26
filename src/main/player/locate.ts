@@ -97,12 +97,3 @@ export async function locateMpv(configured: string | null): Promise<MpvLocation>
       '未找到 mpv 时仍可用外部播放器播放。',
   };
 }
-
-/** 外部播放器：未配置时用系统默认打开方式 */
-export function resolveExternalCommand(template: string | null): { cmd: string; args: (url: string) => string[] } | null {
-  if (!template || !template.trim()) return null;
-  const parts = template.trim().split(/\s+/);
-  const cmd = parts.shift()!;
-  const prefixArgs = parts;
-  return { cmd, args: (url: string) => [...prefixArgs, url] };
-}
