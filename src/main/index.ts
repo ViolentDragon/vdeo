@@ -410,8 +410,15 @@ function createWindow(): void {
             .executeJavaScript(
               `(() => {
                 const nodes = [...document.querySelectorAll('button, [role="button"], label, .nav__item, .tab')];
-                const hit = nodes.find((el) => el.textContent && el.textContent.includes(${JSON.stringify('__TEXT__')}));
-                if (hit) { hit.click(); return true; }
+                const T = ${JSON.stringify('__TEXT__')};
+                // 精确匹配优先：否则「存储源」会被「+ 添加存储源」按钮抢走
+                const exact = nodes.find((el) => el.textContent && el.textContent.trim() === T);
+                if (exact) { exact.click(); return true; }
+                // 其次取最短的包含项（最贴近目标，避免命中包裹性容器）
+                const partial = nodes
+                  .filter((el) => el.textContent && el.textContent.includes(T))
+                  .sort((a, b) => a.textContent.trim().length - b.textContent.trim().length);
+                if (partial.length > 0) { partial[0].click(); return true; }
                 return false;
               })()`.replace(JSON.stringify('__TEXT__'), JSON.stringify(text)),
             )

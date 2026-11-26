@@ -1270,6 +1270,24 @@ function AddSourceDialog({
     }
   };
 
+  // 切到「阿里云盘」页签即自动生成二维码，不用再点一次按钮。
+  // 用 ref 持有 startQr 并配一次性标记，避免依赖变化导致重复出码。
+  const startQrRef = useRef(startQr);
+  useEffect(() => {
+    startQrRef.current = startQr;
+  });
+  const autoQrDone = useRef(false);
+  useEffect(() => {
+    if (kind !== 'aliyun') {
+      autoQrDone.current = false;
+      return;
+    }
+    if (autoQrDone.current) return;
+    autoQrDone.current = true;
+    void startQrRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kind]);
+
   // 轮询扫码状态：确认后主进程已经建好源，这里只需刷新列表并关窗
   useEffect(() => {
     if (!qr) return;
