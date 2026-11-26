@@ -318,3 +318,26 @@ export interface PlaybackRecord {
   finished: boolean;
   updatedAt: number;
 }
+
+/* ------------------------------ 检查更新 ------------------------------ */
+
+export interface UpdateAsset {
+  name: string;
+  size: number;
+  downloadUrl: string;
+}
+
+export interface UpdateInfo {
+  currentVersion: string;
+  /** 远端最新版本号（去掉 v 前缀）；取不到时为 null */
+  latestVersion: string | null;
+  hasUpdate: boolean;
+  releaseUrl: string | null;
+  releaseName: string | null;
+  publishedAt: string | null;
+  notes: string | null;
+  assets: UpdateAsset[];
+  /** 查询失败的原因；成功时为 null */
+  error: string | null;
+  checkedAt: number;
+}

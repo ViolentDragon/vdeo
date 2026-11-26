@@ -16,6 +16,7 @@ import {
   type SourceConfig,
   type SourceKind,
   type StorageSource,
+  type UpdateInfo,
 } from '../shared/types';
 import { ALIST_BRIDGE_STEPS, CLOUD_DRIVES } from '../shared/drives';
 import { IPC, type Rpc } from '../shared/ipc-contract';
@@ -762,6 +763,37 @@ function SettingsPanel({
   const [player, setPlayer] = useState<PlayerConfig>(settings?.player ?? DEFAULT_PLAYER_CONFIG);
   const [detected, setDetected] = useState<PlayerDetectResult | null>(null);
   const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [version, setVersion] = useState<string>('');
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+
+  useEffect(() => {
+    void call<{ version: string }>(IPC.appInfo)
+      .then((r) => setVersion(r.version))
+      .catch(() => undefined);
+  }, []);
+
+  const checkUpdate = async () => {
+    setCheckingUpdate(true);
+    try {
+      setUpdate(await call<UpdateInfo>(IPC.updateCheck));
+    } catch (err) {
+      setUpdate({
+        currentVersion: version,
+        latestVersion: null,
+        hasUpdate: false,
+        releaseUrl: null,
+        releaseName: null,
+        publishedAt: null,
+        notes: null,
+        assets: [],
+        error: err instanceof Error ? err.message : String(err),
+        checkedAt: Date.now(),
+      });
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
 
   useEffect(() => {
     setMpvPath(settings?.mpvPath ?? '');
@@ -992,6 +1024,48 @@ function SettingsPanel({
         </p>
         <p>音频与图片始终交给外部程序打开，不走 mpv 的播放流程。</p>
       </div>
+
+      <div className="panel__head">
+        <h2>关于与更新</h2>
+        <span className="drive-count">v{version || '—'}</span>
+      </div>
+      <div className="row">
+        <button className="btn btn--primary" onClick={() => void checkUpdate()} disabled={checkingUpdate}>
+          {checkingUpdate ? '检查中…' : '检查更新'}
+        </button>
+        {update?.releaseUrl ? (
+          <button
+            className="btn btn--ghost"
+            onClick={(e) => {
+              e.preventDefault();
+              void call(IPC.updateOpenRelease, { url: update.releaseUrl });
+            }}
+          >
+            打开发布页
+          </button>
+        ) : null}
+      </div>
+      {update ? (
+        <div style={{ marginTop: 10 }}>
+          {update.error ? (
+            <div className="error">{update.error}</div>
+          ) : update.hasUpdate ? (
+            <div className="status status--warn">
+              有新版本 <strong>v{update.latestVersion}</strong>（当前 v{update.currentVersion}）
+              {update.assets.length > 0
+                ? ` · 可下载：${update.assets.map((a) => a.name).join(' / ')}`
+                : ''}
+            </div>
+          ) : (
+            <div className="status status--ok">已是最新版本（v{update.latestVersion ?? update.currentVersion}）</div>
+          )}
+          {update.publishedAt ? (
+            <div className="status" style={{ marginTop: 4 }}>
+              远端版本发布于 {new Date(update.publishedAt).toLocaleString()}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="panel__note">
         <h3>关于网盘接入</h3>

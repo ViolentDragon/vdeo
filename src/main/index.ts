@@ -17,6 +17,7 @@ import type {
 } from '../shared/types';
 import { createRepository, type Repository } from './db';
 import { sourceId as newSourceId } from './db/ids';
+import { checkForUpdate, UPDATE_REPO } from './updater';
 import { createProvider } from './sources/registry';
 import { getDriveInfo, listBizExtKeys, pollQrLogin, refreshToken, startQrLogin, type AliyunToken, type DriveInfo, type QrSession } from './sources/aliyun-auth';
 import { encryptSecret } from './sources/secrets';
@@ -417,6 +418,17 @@ function createWindow(): void {
           return steps.length > 0;
         })();
         void switchView.then(() => {
+          // 有些区块在滚动容器底部，截图前先滚到底，否则截不到
+          void win?.webContents
+            .executeJavaScript(
+              `(() => {
+                document.querySelectorAll('.panel, .main, main, body').forEach((el) => {
+                  if (el && typeof el.scrollTop === 'number') el.scrollTop = el.scrollHeight;
+                });
+                return true;
+              })()`,
+            )
+            .catch(() => false);
           setTimeout(() => {
             void win?.webContents
               .capturePage()
@@ -519,8 +531,16 @@ function registerIpc(): void {
 
   handle(IPC.aliyunQrPoll, async (payload: { sessionId: string; name?: string }) => {
     const session = qrSessions.get(payload.sessionId);
-    if (!session) throw new Error('二维码会话已失效，请重新生成');
-    const res = await pollQrLogin(session);
+    if (!session) {
+      log('[aliyun] 轮询时 session 已不存在:', payload.sessionId);
+      throw new Error('二维码会话已失效，请重新生成');
+    }
+    // 轮询本身抛错（网络 / 风控页 / 非 JSON 响应）以前只冒到 UI，日志里看不到。
+    // 这里记一笔再抛，否则用户只看到报错、我却无从定位。
+    const res = await pollQrLogin(session).catch((pollErr: unknown) => {
+      log('[aliyun] 轮询请求失败:', pollErr instanceof Error ? pollErr.message : String(pollErr));
+      throw pollErr;
+    });
     if (res.status !== 'CONFIRMED') return { status: res.status };
     if (!res.token) {
       throw new Error('已扫码确认，但未能从响应中解析出 token（接口结构可能已变化）');
@@ -528,7 +548,15 @@ function registerIpc(): void {
 
     // 诊断：只记字段名不记值。真实扫码后拿到的 bizExt 结构可能与预期不同。
     const bizExtRaw = (res.raw as { bizExt?: unknown } | undefined)?.bizExt;
+    const rawKeys =
+      res.raw && typeof res.raw === 'object' ? Object.keys(res.raw as Record<string, unknown>) : [];
+    log('[aliyun] CONFIRMED raw 顶层键:', rawKeys.join(',') || '(空)', '| bizExt 类型:', typeof bizExtRaw);
     log('[aliyun] bizExt 字段名:', listBizExtKeys(bizExtRaw).join(',') || '(空/无法解析)');
+
+    if (!res.token) {
+      log('[aliyun] 已确认但未解析出 token，bizExt 字段名见上一行');
+      throw new Error('已扫码确认，但未能从响应中解析出 token（接口结构可能已变化）');
+    }
 
     // bizExt 里的 accessToken 很可能只是 passport 会话 token，直接拿来调 openapi 会得到
     // TokenVerifyFailed: invalid access_token（实测）。正确做法是先用 refresh_token
@@ -572,6 +600,19 @@ function registerIpc(): void {
     log('[aliyun] 扫码授权成功，已挂载', source.name, drive.driveId);
     broadcast(IPC.evLibrary, { reason: 'source-added', sourceId: source.id });
     return { status: 'CONFIRMED' as const, source, driveName: drive.driveName };
+  });
+
+  handle(IPC.updateCheck, async () => checkForUpdate(app.getVersion()));
+
+  handle(IPC.updateOpenRelease, async (payload: { url?: string }) => {
+    const url = payload?.url;
+    if (!url) throw new Error('没有可打开的发布页地址');
+    // 只允许打开本仓库的发布页，避免被拼成任意外链
+    if (!url.startsWith(`https://github.com/${UPDATE_REPO}`)) {
+      throw new Error(`拒绝打开非本项目地址：${url}`);
+    }
+    await shell.openExternal(url);
+    return { opened: true };
   });
 
   handle(IPC.pickExecutable, async () => {
