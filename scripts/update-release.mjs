@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
@@ -43,14 +44,45 @@ function nextPatch(current, tags) {
   return `${major}.${minor}.${patch + 1n}`;
 }
 
+function windowsExecutables(version, productName) {
+  return [`${productName}-${version}-x64.exe`, `${productName}-${version}-portable.exe`];
+}
+
+function removeVersionOutput(output) {
+  if (lstatSync(output).isSymbolicLink() || realpathSync(output) !== output) {
+    throw new Error(`无法安全清理 ${output}`);
+  }
+  rmSync(output, { recursive: true, force: true });
+}
+
+function pruneOldPackages(tag) {
+  if (!existsSync(join(releaseDir, tag))) return;
+  for (const entry of readdirSync(releaseDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === tag || !entry.name.startsWith('v') || !versionParts(entry.name)) continue;
+    try {
+      removeVersionOutput(join(realpathSync(releaseDir), entry.name));
+      console.log(`[update] 已清理旧的本地版本 ${entry.name}。`);
+    } catch (error) {
+      console.warn(`[update] 清理 ${entry.name} 失败：${error.message}`);
+    }
+  }
+}
+
 function packageWindows(version, productName) {
-  const output = join(releaseDir, `v${version}`);
+  const output = join(realpathSync(releaseDir), `v${version}`);
+  const hadOutput = existsSync(output);
+  if (hadOutput && realpathSync(output) !== output) throw new Error(`无法安全写入 ${output}`);
   npm('run', 'typecheck');
-  npm('run', 'pack', '--', '--publish=never', `--config.extraMetadata.version=${version}`,
-    `--config.directories.output=${output}`);
-  npm('test');
-  for (const name of [`${productName}-${version}-x64.exe`, `${productName}-${version}-portable.exe`]) {
-    if (!existsSync(join(output, name))) throw new Error(`缺少打包产物 ${name}`);
+  try {
+    npm('run', 'pack', '--', '--publish=never', `--config.extraMetadata.version=${version}`,
+      `--config.directories.output=${output}`);
+    npm('test');
+    for (const name of windowsExecutables(version, productName)) {
+      if (!existsSync(join(output, name))) throw new Error(`缺少打包产物 ${name}`);
+    }
+  } catch (error) {
+    if (!hadOutput && existsSync(output)) removeVersionOutput(output);
+    throw error;
   }
   console.log(`[update] Windows 安装包和便携版已生成：${output}`);
 }
@@ -92,9 +124,53 @@ async function pushRelease(branch, tag, repo, reauthorize) {
     console.error(`[update] ${tag} 已保存在本地。排除推送问题后可重新运行，本次版本会继续推送。`);
     throw error;
   }
-  console.log(`[update] ${tag} 已推送，GitHub Actions 将打包并发布 Release。`);
+  console.log(`[update] ${tag} 已推送，等待 GitHub Actions 发布。`);
   console.log(`https://github.com/${repo}/actions/workflows/windows-release.yml`);
-  console.log(`https://github.com/${repo}/releases/tag/${tag}`);
+}
+
+function githubReadToken(pushUrl) {
+  if (process.env.GH_TOKEN || process.env.GITHUB_TOKEN) return process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+  if (!pushUrl.startsWith('https://')) return;
+  const result = spawnSync('git', ['credential', 'fill'], {
+    cwd: root,
+    input: `url=${pushUrl}\n\n`,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'ignore'],
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'Never' },
+    windowsHide: true,
+  });
+  return /^password=(.+)$/m.exec(result.stdout ?? '')?.[1].trim();
+}
+
+async function waitForGitHubRelease(repo, pushUrl, tag, productName) {
+  const token = githubReadToken(pushUrl);
+  const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'Nebula-release' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const api = `https://api.github.com/repos/${repo}`;
+  const query = new URLSearchParams({ event: 'push', head_sha: git('rev-parse', `${tag}^{commit}`), per_page: '1' });
+  const deadline = Date.now() + 35 * 60_000;
+  while (Date.now() < deadline) {
+    const response = await fetch(`${api}/actions/workflows/windows-release.yml/runs?${query}`, {
+      headers, signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) throw new Error(`无法查询 GitHub Actions（HTTP ${response.status}）。`);
+    const { workflow_runs: [workflow] } = await response.json();
+    if (workflow?.status === 'completed') {
+      if (workflow.conclusion !== 'success') throw new Error(`${tag} 的 GitHub Actions 发布失败：${workflow.html_url}`);
+      const result = await fetch(`${api}/releases/tags/${tag}`, { headers, signal: AbortSignal.timeout(15_000) });
+      if (!result.ok) throw new Error(`无法查询 ${tag} 的 GitHub Release（HTTP ${result.status}）。`);
+      const release = await result.json();
+      const expected = windowsExecutables(tag.slice(1), productName);
+      if (release.draft || !expected.every((name) => release.assets.some((asset) => asset.name === name && asset.state === 'uploaded' && asset.size > 0))) {
+        throw new Error(`${tag} 的 GitHub Release 尚未发布完整的 Windows 程序包。`);
+      }
+      console.log(`[update] ${tag} 的 GitHub Release 已发布，安装包和便携版均已上传。`);
+      console.log(release.html_url);
+      return;
+    }
+    await delay(30_000);
+  }
+  throw new Error(`等待 ${tag} 的 GitHub Release 超时，请查看上方的工作流链接。`);
 }
 
 async function update(pkg, packageOnly, reauthOnWorkflowError) {
@@ -117,12 +193,18 @@ async function update(pkg, packageOnly, reauthOnWorkflowError) {
     if (ancestor.status !== 0) throw new Error(`远端 ${branch} 包含本地尚未合入的提交。请先同步分支。`);
   }
   const localTags = git('tag', '--list').split('\n').filter(Boolean);
+  const publish = async (tag) => {
+    await pushRelease(branch, tag, repo, reauthorize);
+    pruneOldPackages(tag);
+    await waitForGitHubRelease(repo, pushUrl, tag, pkg.productName);
+  };
+
   const currentTag = `v${pkg.version}`;
   const currentRef = `refs/tags/${currentTag}`;
   if (localTags.includes(currentTag) && !remoteRefs.has(currentRef)
     && git('rev-parse', `${currentRef}^{commit}`) === git('rev-parse', 'HEAD')) {
     console.log(`[update] 继续发布已提交的 ${currentTag}。`);
-    return pushRelease(branch, currentTag, repo, reauthorize);
+    return publish(currentTag);
   }
 
   git('var', 'GIT_AUTHOR_IDENT');
@@ -138,7 +220,7 @@ async function update(pkg, packageOnly, reauthOnWorkflowError) {
   run('git', ['add', '--all']);
   run('git', ['commit', '-m', `release: ${tag}`]);
   run('git', ['tag', tag]);
-  await pushRelease(branch, tag, repo, reauthorize);
+  await publish(tag);
 }
 
 try {
@@ -148,13 +230,14 @@ try {
     help: { type: 'boolean' },
   } });
   if (values.help) {
-    console.log('npm run update                    打包后提交代码和版本标签，并触发 GitHub Release');
+    console.log('npm run update                    增加补丁版本号，打包、推送并确认 GitHub Release');
     console.log('npm run update -- --package-only   为当前版本生成 Windows 安装包和便携版');
     console.log('npm run update -- --reauth-on-workflow-error   工作流写入被拒绝时重新授权并重试');
   } else {
     if (process.platform !== 'win32') throw new Error('请在 Windows 上运行此脚本');
     if (!process.env.npm_execpath) throw new Error('请通过 npm run update 运行');
     mkdirSync(releaseDir, { recursive: true });
+    if (realpathSync(releaseDir) !== join(realpathSync(root), 'release')) throw new Error('release 必须位于项目目录内');
     const lock = join(releaseDir, '.update.lock');
     try {
       writeFileSync(lock, `${process.pid}\n`, { flag: 'wx' });

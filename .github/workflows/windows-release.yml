@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and publish
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
 
 concurrency:
-  group: windows-release-${{ github.ref }}
+  group: windows-release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -19,17 +28,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: 24
           package-manager-cache: false
       - run: npm ci
+      - name: Locate runner 7-Zip
+        shell: pwsh
+        run: |
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+          if (!(Test-Path -LiteralPath $sevenZip -PathType Leaf)) {
+            throw '7-Zip is missing from the Windows runner.'
+          }
+          "NEBULA_7ZA=$sevenZip" >> $env:GITHUB_ENV
       - name: Validate tag
         shell: pwsh
         run: |
           $version = node -p "require('./package.json').version"
-          if ("v$version" -cne $env:GITHUB_REF_NAME) {
+          if ("v$version" -cne $env:RELEASE_TAG) {
             throw 'The tag must match the package version.'
           }
       - name: Build and test
@@ -39,7 +57,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
+          $tag = $env:RELEASE_TAG
           $version = $tag.Substring(1)
           $product = node -p "require('./package.json').productName"
           $directory = "release/$tag"
@@ -49,14 +67,14 @@ jobs:
           }
           $existing = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft,assets 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag @assets --repo $env:GITHUB_REPOSITORY --verify-tag --generate-notes
+            gh release create $tag @assets --repo $env:GITHUB_REPOSITORY --verify-tag --generate-notes --latest
             exit $LASTEXITCODE
           }
           $release = $existing | ConvertFrom-Json
           if ($release.isDraft) {
             gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false
+            gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest
             exit $LASTEXITCODE
           }
           $publishedNames = @($release.assets | ForEach-Object { $_.name })

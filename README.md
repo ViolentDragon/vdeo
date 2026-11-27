@@ -68,11 +68,11 @@ npm run typecheck               # 主进程与渲染层分别做类型检查
 
 ### 一键打包和发布
 
-在 Windows 双击 `update-release.cmd` 或运行 `npm run update`。脚本从本地和 GitHub 标签计算下一个补丁版本，验证并打包安装版与便携版，再将 Git 未忽略的工作区更改和版本文件提交到当前分支。分支与版本标签会一起推送到 `origin`。推送成功后，GitHub Actions 从该标签构建并发布 Release。
+在 Windows 双击 `update-release.cmd` 或运行 `npm run update`。脚本从本地和 GitHub 标签计算下一个补丁版本，验证并打包安装版与便携版，再将 Git 未忽略的工作区更改和版本文件提交到当前分支。分支与版本标签会一起推送到 `origin`。推送成功后，脚本等待 GitHub Actions 完成，并核实对应 Release 已发布安装版和便携版。
 
-- 本地程序包在 `release/v版本号/`。只生成当前版本的本地程序包可运行 `npm run update -- --package-only`。
+- 本地程序包在 `release/v版本号/`。发布脚本推送成功后清理旧版本目录，并保留 `release/desktop/`。只生成当前版本的本地程序包可运行 `npm run update -- --package-only`。
 - 发布使用已有的 GitHub Git 凭据。首次推送包含工作流文件，需要允许修改 GitHub Actions 工作流的凭据。仓库须启用 Actions，并允许该工作流创建 Release。脚本会输出 Actions 和 Release 的地址。
-- 双击 `update-release.cmd` 时，如果 GitHub 拒绝写入工作流，脚本会打开 Git Credential Manager 的 GitHub 授权页面。确认授权后会自动重试已提交的版本。遇到其他推送错误，排除问题后可重新运行同一脚本。如果 GitHub 构建或上传失败，可在 Actions 中重跑该工作流。
+- 双击 `update-release.cmd` 时，如果 GitHub 拒绝写入工作流，脚本会打开 Git Credential Manager 的 GitHub 授权页面。确认授权后会自动重试已提交的版本。遇到其他推送错误，排除问题后可重新运行同一脚本。如果 GitHub 构建或上传失败，可重跑该工作流，也可在 Actions 的 Windows Release 中输入已有标签重新发布。
 
 ### 内置 mpv
 

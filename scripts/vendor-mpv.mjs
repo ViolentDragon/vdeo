@@ -7,7 +7,7 @@
  *   1. 查 shinchiro/mpv-winbuild-cmake 的最新 release（Windows x86_64 官方性质构建）
  *   2. 挑标准 x86_64 包（排除 -v3 需要 AVX2、dev/debug 变体）
  *   3. 下载 .7z 到 vendor/downloads/（缓存，已存在则跳过）
- *   4. 用 electron-builder 缓存里的 7za 解压到 vendor/mpv/
+ *   4. 用 7-Zip 解压到 vendor/mpv/
  *   5. 校验 mpv.exe 并打印版本
  *
  * 产出由 electron-builder 的 extraResources 复制到 resources/mpv/，
@@ -27,8 +27,10 @@ const FORCE = process.argv.includes('--force');
 const RELEASES_API = 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest';
 
 function find7za() {
+  const programFiles = process.env.ProgramW6432 ?? process.env.ProgramFiles;
   const candidates = [
     process.env['NEBULA_7ZA'],
+    programFiles && join(programFiles, '7-Zip', '7z.exe'),
     join(ROOT, 'node_modules', '7zip-bin', 'win', 'x64', '7za.exe'),
   ].filter(Boolean);
 
@@ -51,8 +53,7 @@ function find7za() {
     if (c && existsSync(c)) return c;
   }
   throw new Error(
-    '找不到 7za.exe。先跑一次 `npm run pack:dir`（electron-builder 会下载 7zip 到缓存），' +
-      '或用环境变量 NEBULA_7ZA 指定 7za.exe 的路径。',
+    '找不到 7-Zip。请安装 7-Zip，或用环境变量 NEBULA_7ZA 指定 7z.exe 或 7za.exe 的路径。',
   );
 }
 
