@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const SRC = join(ROOT, 'release', 'win-unpacked');
-const DEST = process.env['NEBULA_DESKTOP_DIR'] || 'D:\\Program\\Nebula';
+const DEST = process.env['NEBULA_DESKTOP_DIR'] || join(ROOT, 'release', 'desktop');
 const MAKE_SHORTCUT = process.argv.includes('--shortcut');
 
 function exists(p) {

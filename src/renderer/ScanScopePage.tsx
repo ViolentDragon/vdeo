@@ -5,8 +5,9 @@ import { call, Icon, PageHeading } from './ui';
 
 type ListedFolder = ScanFolderRef & { isDir: boolean };
 
-export function ScanScopePage({ source, onBack, onSave }: {
+export function ScanScopePage({ source, allowScan = true, onBack, onSave }: {
   source: StorageSource;
+  allowScan?: boolean;
   onBack: () => void;
   onSave: (scope: ScanScope, scanNow: boolean) => Promise<void>;
 }) {
@@ -111,9 +112,9 @@ export function ScanScopePage({ source, onBack, onSave }: {
       {saveError ? <p className="error" role="alert">{saveError}</p> : null}
       <div className="page-actions">
         <button className="btn btn--ghost" disabled={!canSave || saving} onClick={() => void save(false)}>保存</button>
-        <button className="btn btn--primary" disabled={!canSave || saving || !source.enabled} onClick={() => void save(true)}>
+        {allowScan ? <button className="btn btn--primary" disabled={!canSave || saving || !source.enabled} onClick={() => void save(true)}>
           <Icon name="scan" /> {saving ? '正在保存…' : '保存并扫描'}
-        </button>
+        </button> : null}
       </div>
     </div>
   </section>;

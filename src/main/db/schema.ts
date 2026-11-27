@@ -1,6 +1,6 @@
 /** SQLite DDL — 迁移通过 PRAGMA user_version 递增执行 */
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 5;
 
 export const DDL_V1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -81,3 +81,33 @@ CREATE TABLE work_genres (
 `;
 
 export const DDL_V3 = `ALTER TABLE items ADD COLUMN poster_item_id TEXT;`;
+
+export const WORK_KEY = `CASE
+  WHEN series_key IS NOT NULL THEN 'series:' || series_key
+  WHEN section = 'movie' THEN 'movie:' || lower(replace(replace(trim(title), ' ', ''), '·', '')) || '#' || COALESCE(year, '')
+  ELSE id END`;
+
+export const DDL_V4 = `ALTER TABLE items ADD COLUMN search_alias TEXT;`;
+
+export const DDL_V5 = `
+CREATE TABLE tmdb_metadata (
+  tmdb_work_key TEXT PRIMARY KEY,
+  tmdb_id INTEGER,
+  tmdb_year INTEGER,
+  tmdb_poster TEXT,
+  tmdb_backdrop TEXT,
+  tmdb_overview TEXT,
+  tmdb_rating REAL,
+  checked_at INTEGER NOT NULL
+);
+
+CREATE VIEW library_items AS
+  SELECT items.*, ${WORK_KEY} AS work_key,
+         COALESCE(poster, tmdb_poster) AS display_poster,
+         COALESCE(backdrop, tmdb_backdrop) AS display_backdrop,
+         COALESCE(overview, tmdb_overview) AS display_overview,
+         COALESCE(rating, tmdb_rating) AS display_rating,
+         CASE WHEN series_key IS NULL THEN COALESCE(year, tmdb_year)
+           ELSE COALESCE(tmdb_year, year) END AS display_year
+  FROM items LEFT JOIN tmdb_metadata ON tmdb_work_key = (${WORK_KEY});
+`;

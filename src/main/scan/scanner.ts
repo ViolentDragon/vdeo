@@ -67,6 +67,7 @@ function makeItem(
   entry: RemoteEntry,
   displayPath: string,
   artwork: ArtworkFolder[],
+  alternateTitle: string | null,
   now: number,
 ): MediaItem | null {
   const ext = extOf(entry.name);
@@ -85,6 +86,7 @@ function makeItem(
       mtime: entry.mtime,
       section: parsed.section,
       title: parsed.title,
+      searchAlias: parsed.section === 'movie' && !/\p{Script=Han}/u.test(parsed.title) ? alternateTitle : null,
       year: parsed.year,
       season: parsed.season,
       episode: parsed.episode,
@@ -99,7 +101,7 @@ function makeItem(
       releaseGroup: parsed.releaseGroup,
       confidence: parsed.confidence,
       poster: null,
-      posterItemId: parsed.seriesTitle ? findPoster(sourceId, parsed.seriesTitle, artwork) : null,
+      posterItemId: findPoster(sourceId, parsed.seriesTitle ?? parsed.title, artwork),
       backdrop: null,
       overview: null,
       rating: null,
@@ -234,6 +236,10 @@ export async function scanSource(opts: ScanOptions): Promise<ScanSummary> {
         const images = entries.filter((entry) => !entry.isDir && POSTER_FORMATS.has(extOf(entry.name)) && !ignored(entry.name, ignorePatterns));
         const folderName = dir.displayPath.split(/[\\/]/).filter(Boolean).at(-1) ?? '';
         const artwork = images.length ? [...dir.artwork, { name: folderName, images }] : dir.artwork;
+        const alternateTitle = /\p{Script=Han}/u.test(folderName)
+          && !/^(?:电影|影片|资源|合集|视频|蓝光|原盘)$/u.test(folderName)
+          && entries.filter((entry) => !entry.isDir && VIDEO_EXTS.has(extOf(entry.name))).length === 1
+          ? seriesFolderTitle(folderName) || null : null;
         for (const entry of entries) {
           scanned += 1;
           if (scanned > maxEntries) {
@@ -255,7 +261,7 @@ export async function scanSource(opts: ScanOptions): Promise<ScanSummary> {
           const ext = extOf(name);
           if (SUBTITLE_EXTS.has(ext)) continue;
 
-          const item = makeItem(source.id, entry, displayPath, artwork, now);
+          const item = makeItem(source.id, entry, displayPath, artwork, alternateTitle, now);
           if (item) {
             found += 1;
             seenItemIds?.add(item.id);

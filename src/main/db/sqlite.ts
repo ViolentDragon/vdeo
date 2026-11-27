@@ -15,6 +15,7 @@ export interface StatementLike {
 export interface SqliteHandle {
   exec(sql: string): void;
   prepare(sql: string): StatementLike;
+  function(name: string, options: { deterministic: boolean }, fn: (...args: SqlValue[]) => SqlValue): void;
   close(): void;
 }
 

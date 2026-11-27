@@ -5,6 +5,7 @@ import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { PLAYBACK_SHORTCUTS } from '../../shared/playback-shortcuts';
 import type { PlaybackTarget, PlayerState, TrackInfo } from '../../shared/types';
 
 export interface MpvOptions {
@@ -38,6 +39,9 @@ const INITIAL_STATE: PlayerState = {
 
 const OBSERVED = ['pause', 'time-pos', 'duration', 'volume', 'mute', 'speed', 'track-list', 'fullscreen', 'aid', 'sid'];
 
+const CLICK_INTERVAL_MS = 300;
+const CONTROL_MESSAGE = 'nebula-playback-input';
+
 export class MpvController extends EventEmitter {
   private state: PlayerState = { ...INITIAL_STATE };
   private proc: ChildProcess | null = null;
@@ -48,6 +52,8 @@ export class MpvController extends EventEmitter {
   private pipePath: string;
   private starting: Promise<void> | null = null;
   private stopping = false;
+  private paused = false;
+  private pendingClick: NodeJS.Timeout | null = null;
   private pendingSubtitles: string[] = [];
   private lastTarget: PlaybackTarget | null = null;
   private saveTimer: NodeJS.Timeout | null = null;
@@ -92,12 +98,15 @@ export class MpvController extends EventEmitter {
       '--msg-level=all=warn',
       `--hwdec=${this.opts.hardwareDecode ? 'auto-safe' : 'no'}`,
     ];
-    if (this.opts.wid) args.push(`--wid=${this.opts.wid}`);
     if (this.opts.extraArgs?.length) args.push(...this.opts.extraArgs);
+    if (this.opts.wid) {
+      args.push(`--wid=${this.opts.wid}`, "--osc=no", "--fullscreen=no", "--force-window=no", "--window-dragging=no",
+        "--input-vo-keyboard=yes", "--input-cursor=yes", "--input-cursor-passthrough=no", "--input-default-bindings=no", "--input-doubleclick-time=0");
+    }
 
     this.stopping = false;
     const proc = spawn(this.opts.mpvPath, args, {
-      windowsHide: false,
+      windowsHide: Boolean(this.opts.wid),
       stdio: ['ignore', 'ignore', 'pipe'],
     });
     this.proc = proc;
@@ -110,6 +119,8 @@ export class MpvController extends EventEmitter {
       this.patch({ status: 'error', error: `无法启动 mpv：${err.message}` });
     });
     proc.on('exit', (code) => {
+      if (this.proc !== proc) return;
+      this.clearPendingClick();
       this.proc = null;
       this.sock?.destroy();
       this.sock = null;
@@ -133,6 +144,7 @@ export class MpvController extends EventEmitter {
       try {
         await this.connectOnce();
         await this.attachObservers();
+        if (this.opts.wid) await this.bindEmbeddedControls();
         return;
       } catch (err) {
         lastErr = err instanceof Error ? err : new Error(String(err));
@@ -179,6 +191,43 @@ export class MpvController extends EventEmitter {
     }
   }
 
+  private async bindEmbeddedControls(): Promise<void> {
+    const bindings = PLAYBACK_SHORTCUTS.flatMap(({ code, mpv, repeat }) => {
+      const command = (repeat ? "repeatable " : "norepeat ") + "script-message " + CONTROL_MESSAGE + " " + code;
+      const letter = mpv.length === 1;
+      return (letter ? [mpv, mpv.toUpperCase()] : [mpv]).map((key) => ["keybind", key, command]);
+    });
+    bindings.push(
+      ["keybind", "MBTN_LEFT", "script-message " + CONTROL_MESSAGE + " click"],
+      ["keybind", "WHEEL_UP", "script-message " + CONTROL_MESSAGE + " ArrowUp"],
+      ["keybind", "WHEEL_DOWN", "script-message " + CONTROL_MESSAGE + " ArrowDown"],
+    );
+    await Promise.allSettled(bindings.map((binding) => this.send(binding, 2000)));
+  }
+
+  private clearPendingClick(): void {
+    if (this.pendingClick) clearTimeout(this.pendingClick);
+    this.pendingClick = null;
+  }
+
+  handleEmbeddedInput(code: unknown): void {
+    if (!this.opts.wid || this.stopping || (this.state.status !== "playing" && this.state.status !== "paused")) return;
+    if (code === "click") {
+      if (this.pendingClick) {
+        this.clearPendingClick();
+        this.emit("shortcut", { command: "fullscreen" });
+      } else {
+        this.pendingClick = setTimeout(() => {
+          this.pendingClick = null;
+          if (this.state.status === "playing" || this.state.status === "paused") this.emit("shortcut", { command: "toggle-pause" });
+        }, CLICK_INTERVAL_MS);
+      }
+      return;
+    }
+    const shortcut = PLAYBACK_SHORTCUTS.find((entry) => entry.code === code);
+    if (shortcut) this.emit("shortcut", shortcut);
+  }
+
   private onData(chunk: Buffer): void {
     this.buffer += chunk.toString('utf8');
     let idx = this.buffer.indexOf('\n');
@@ -212,17 +261,25 @@ export class MpvController extends EventEmitter {
     if (typeof event !== 'string') return;
 
     switch (event) {
+      case 'client-message': {
+        const args = msg['args'];
+        if (Array.isArray(args) && args[0] === CONTROL_MESSAGE) this.handleEmbeddedInput(args[1]);
+        break;
+      }
       case 'property-change': {
         const name = String(msg['name']);
         const data = msg['data'];
         if (name === 'time-pos' && typeof data === 'number') this.patch({ position: data });
         else if (name === 'duration' && typeof data === 'number') this.patch({ duration: data });
         else if (name === 'pause' && typeof data === 'boolean') {
-          if (this.state.status !== 'ended') this.patch({ status: data ? 'paused' : 'playing' });
+          this.paused = data;
+          if (this.state.status === 'playing' || this.state.status === 'paused') {
+            this.patch({ status: data ? 'paused' : 'playing' });
+          }
         } else if (name === 'volume' && typeof data === 'number') this.patch({ volume: data });
         else if (name === 'mute' && typeof data === 'boolean') this.patch({ muted: data });
         else if (name === 'speed' && typeof data === 'number') this.patch({ speed: data });
-        else if (name === 'fullscreen' && typeof data === 'boolean') this.patch({ fullscreen: data });
+        else if (name === 'fullscreen' && typeof data === 'boolean' && !this.opts.wid) this.patch({ fullscreen: data });
         else if (name === 'track-list' && Array.isArray(data)) this.patch({ tracks: toTracks(data) });
         else if (name === 'aid' && (typeof data === 'number' || data === null)) {
           this.patch({ activeAudioId: typeof data === 'number' ? data : null });
@@ -232,7 +289,7 @@ export class MpvController extends EventEmitter {
         break;
       }
       case 'file-loaded': {
-        this.patch({ status: 'playing', error: null });
+        this.patch({ status: this.paused ? 'paused' : 'playing', error: null });
         void this.applySubtitles();
         break;
       }
@@ -243,16 +300,11 @@ export class MpvController extends EventEmitter {
           this.emit('finished', this.state.itemId);
         } else if (reason === 'error') {
           this.patch({ status: 'error', error: '播放失败（解码或地址不可达）' });
-        } else if (reason === 'stop') {
+        } else if (reason === 'stop' && this.state.status !== 'loading') {
           this.patch({ status: 'idle', itemId: null });
         }
         break;
       }
-      case 'idle':
-        // mpv 加载失败后会立刻回到 idle（--idle=yes）。不能让它覆盖 error，
-        // 否则用户看不到失败原因，UI 只显示一个空白的"空闲"。
-        if (this.state.status !== 'error') this.patch({ status: 'idle' });
-        break;
       default:
         break;
     }
@@ -304,6 +356,7 @@ export class MpvController extends EventEmitter {
 
   async play(target: PlaybackTarget): Promise<void> {
     await this.ensureStarted();
+    this.clearPendingClick();
     this.lastTarget = target;
     this.patch({ status: 'loading', itemId: target.itemId, title: target.title, error: null, position: target.startAt, duration: 0 });
     const headerField = Object.entries(target.headers)
@@ -326,8 +379,7 @@ export class MpvController extends EventEmitter {
   async togglePause(): Promise<void> {
     if (!this.sock) return;
     try {
-      const paused = await this.send(['get_property', 'pause']);
-      await this.setProperty('pause', !paused);
+      await this.send(['cycle', 'pause']);
     } catch {
       /* ignore */
     }
@@ -335,7 +387,7 @@ export class MpvController extends EventEmitter {
 
   async seek(seconds: number, mode: 'absolute' | 'relative' = 'absolute'): Promise<void> {
     try {
-      await this.send(['seek', seconds, mode]);
+      await this.send(['seek', seconds, mode === 'relative' ? 'relative+exact' : mode]);
     } catch {
       /* ignore */
     }
@@ -349,10 +401,17 @@ export class MpvController extends EventEmitter {
     }
   }
 
+  async adjustVolume(delta: number): Promise<void> {
+    try {
+      await this.send(['add', 'volume', delta]);
+    } catch {
+      /* ignore */
+    }
+  }
+
   async toggleMute(): Promise<void> {
     try {
-      const m = await this.send(['get_property', 'mute']);
-      await this.setProperty('mute', !m);
+      await this.send(['cycle', 'mute']);
     } catch {
       /* ignore */
     }
@@ -399,8 +458,13 @@ export class MpvController extends EventEmitter {
     }
   }
 
+  setEmbeddedFullscreen(fullscreen: boolean): void {
+    if (this.opts.wid) this.patch({ fullscreen });
+  }
+
   async stop(): Promise<void> {
     this.stopping = true;
+    this.clearPendingClick();
     this.pendingSubtitles = [];
     if (this.sock) {
       try {
@@ -408,12 +472,12 @@ export class MpvController extends EventEmitter {
       } catch {
         /* ignore */
       }
-      this.sock.destroy();
+      this.sock?.destroy();
       this.sock = null;
     }
     this.proc?.kill();
     this.proc = null;
-    this.patch({ status: 'idle', itemId: null, title: null, position: 0, duration: 0, tracks: [] });
+    this.patch({ status: 'idle', itemId: null, title: null, position: 0, duration: 0, tracks: [], fullscreen: false });
   }
 
   dispose(): void {

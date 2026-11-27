@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,10 +55,39 @@ function packageWindows(version, productName) {
   console.log(`[update] Windows 安装包和便携版已生成：${output}`);
 }
 
-function pushRelease(branch, tag, repo) {
-  const tagRef = `refs/tags/${tag}`;
+function pushGit(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, { cwd: root, stdio: ['inherit', 'inherit', 'pipe'], windowsHide: true });
+    let stderr = '';
+    child.stderr.setEncoding('utf8').on('data', (chunk) => {
+      process.stderr.write(chunk);
+      stderr = (stderr + chunk).slice(-16_384);
+    });
+    child.once('error', reject);
+    child.once('close', (code) => resolve({ code, stderr }));
+  });
+}
+
+function workflowPermissionDenied(stderr) {
+  return /create or update workflow/i.test(stderr)
+    && /without\s+(?:the\s+)?[`'"]?workflows?[`'"]?\s+(?:scope|permission)/i.test(stderr);
+}
+
+async function pushRelease(branch, tag, repo, reauthorize) {
+  const args = ['push', '--atomic', 'origin', `HEAD:refs/heads/${branch}`, `refs/tags/${tag}`];
   try {
-    run('git', ['push', '--atomic', 'origin', `HEAD:refs/heads/${branch}`, tagRef]);
+    let result = await pushGit(args);
+    if (reauthorize && result.code !== null && result.code !== 0 && workflowPermissionDenied(result.stderr)) {
+      console.log('[update] GitHub 凭据缺少工作流写权限。请在浏览器中确认 GitHub 授权，完成后会重试当前版本。');
+      run('git', ['credential-manager', 'github', 'login', '--browser', '--force']);
+      result = await pushGit(args);
+    }
+    if (result.code !== 0) {
+      if (workflowPermissionDenied(result.stderr)) {
+        console.error('[update] 请使用有仓库写入和工作流写入权限的 GitHub 凭据，再运行 update-release.cmd。');
+      }
+      throw new Error('git push 失败');
+    }
   } catch (error) {
     console.error(`[update] ${tag} 已保存在本地。排除推送问题后可重新运行，本次版本会继续推送。`);
     throw error;
@@ -68,10 +97,12 @@ function pushRelease(branch, tag, repo) {
   console.log(`https://github.com/${repo}/releases/tag/${tag}`);
 }
 
-function update(pkg, packageOnly) {
+async function update(pkg, packageOnly, reauthOnWorkflowError) {
   if (packageOnly) return packageWindows(pkg.version, pkg.productName);
 
-  const repo = gitHubUrl.exec(git('remote', 'get-url', '--push', 'origin'))?.[1];
+  const pushUrl = git('remote', 'get-url', '--push', 'origin');
+  const repo = gitHubUrl.exec(pushUrl)?.[1];
+  const reauthorize = reauthOnWorkflowError && /^https:\/\//i.test(pushUrl);
   if (!repo) throw new Error('origin 必须指向 github.com 仓库');
   const branch = git('symbolic-ref', '--short', 'HEAD');
   const branchRef = `refs/heads/${branch}`;
@@ -90,7 +121,8 @@ function update(pkg, packageOnly) {
   const currentRef = `refs/tags/${currentTag}`;
   if (localTags.includes(currentTag) && !remoteRefs.has(currentRef)
     && git('rev-parse', `${currentRef}^{commit}`) === git('rev-parse', 'HEAD')) {
-    return pushRelease(branch, currentTag, repo);
+    console.log(`[update] 继续发布已提交的 ${currentTag}。`);
+    return pushRelease(branch, currentTag, repo, reauthorize);
   }
 
   git('var', 'GIT_AUTHOR_IDENT');
@@ -106,17 +138,19 @@ function update(pkg, packageOnly) {
   run('git', ['add', '--all']);
   run('git', ['commit', '-m', `release: ${tag}`]);
   run('git', ['tag', tag]);
-  pushRelease(branch, tag, repo);
+  await pushRelease(branch, tag, repo, reauthorize);
 }
 
 try {
   const { values } = parseArgs({ options: {
     'package-only': { type: 'boolean' },
+    'reauth-on-workflow-error': { type: 'boolean' },
     help: { type: 'boolean' },
   } });
   if (values.help) {
     console.log('npm run update                    打包后提交代码和版本标签，并触发 GitHub Release');
     console.log('npm run update -- --package-only   为当前版本生成 Windows 安装包和便携版');
+    console.log('npm run update -- --reauth-on-workflow-error   工作流写入被拒绝时重新授权并重试');
   } else {
     if (process.platform !== 'win32') throw new Error('请在 Windows 上运行此脚本');
     if (!process.env.npm_execpath) throw new Error('请通过 npm run update 运行');
@@ -131,7 +165,7 @@ try {
     try {
       const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
       if (!versionParts(pkg.version)) throw new Error('package.json 版本应为 major.minor.patch');
-      update(pkg, values['package-only']);
+      await update(pkg, values['package-only'], values['reauth-on-workflow-error']);
     } finally {
       unlinkSync(lock);
     }

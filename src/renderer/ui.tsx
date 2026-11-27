@@ -1,8 +1,9 @@
 import { useEffect, useRef, type ReactNode } from 'react';
 import { IPC, type Rpc } from '../shared/ipc-contract';
+import { api } from './api';
 
 export async function call<T>(channel: string, payload?: unknown): Promise<T> {
-  const result = await window.nebula.invoke<Rpc<T>>(channel, payload);
+  const result = await api.invoke<Rpc<T>>(channel, payload);
   if (!result.ok) throw new Error(result.error);
   return result.data;
 }
@@ -36,6 +37,7 @@ const icons = {
   fullscreen: 'M4 9V4h5m6 0h5v5m0 6v5h-5m-6 0H4v-5',
   close: 'm6 6 12 12M18 6 6 18',
   edit: 'm4 16-1 5 5-1L20 8l-4-4z m10-10 4 4',
+  info: 'M12 11v6 M12 7h.01 M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0Z',
   check: 'm5 12 5 5L20 7',
   cloud: 'M7 19a5 5 0 0 1-.7-10A6 6 0 0 1 18 8a5.5 5.5 0 0 1-.5 11z',
   link: 'M10 14l4-4 M8 16l-1 1a3.5 3.5 0 0 1-5-5l5-5a3.5 3.5 0 0 1 5 0 M16 8l1-1a3.5 3.5 0 0 1 5 5l-5 5a3.5 3.5 0 0 1-5 0',

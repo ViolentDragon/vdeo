@@ -4,6 +4,10 @@ export const IPC = {
   appInfo: 'app:info',
   settingsGet: 'settings:get',
   settingsUpdate: 'settings:update',
+  tmdbStatus: 'tmdb:status',
+  tmdbConfigure: 'tmdb:configure',
+  tmdbSyncStart: 'tmdb:sync-start',
+  tmdbSyncCancel: 'tmdb:sync-cancel',
   mpvLocate: 'mpv:locate',
   localPaths: 'app:local-paths',
 
@@ -39,10 +43,12 @@ export const IPC = {
   playItem: 'play:item',
   playCommand: 'play:command',
   playStop: 'play:stop',
+  playSurface: 'play:surface',
 
   evScan: 'ev:scan',
   evPlayer: 'ev:player',
   evLibrary: 'ev:library',
+  evTmdbSync: 'ev:tmdb-sync',
 } as const;
 
 export type Rpc<T> = { ok: true; data: T } | { ok: false; error: string };

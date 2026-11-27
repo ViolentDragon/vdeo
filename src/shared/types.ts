@@ -129,9 +129,10 @@ export interface MediaItem {
   /** 解析置信度 0..1，低置信度条目在 UI 可提示人工修正 */
   confidence: number;
 
-  /** 元数据与本地缓存的图片路径 */
+  /** 元数据与图片地址 */
   poster: string | null;
   posterItemId?: string | null;
+  searchAlias?: string | null;
   backdrop: string | null;
   overview: string | null;
   rating: number | null;
@@ -157,6 +158,8 @@ export interface SeriesSummary {
   seasons: number[];
   poster: string | null;
   posterItemId: string | null;
+  overview: string | null;
+  rating: number | null;
   artworkId: string;
   genres: Genre[];
   latestAddedAt: number;
@@ -174,7 +177,7 @@ export interface BrowseQuery {
   order?: 'asc' | 'desc';
   offset?: number;
   limit?: number;
-  /** item=按文件；series=按剧集聚合卡片 */
+  /** item=按文件；series=只聚合剧集；catalog=按作品聚合。视频搜索使用作品聚合。 */
   group?: 'item' | 'series' | 'catalog';
   genre?: Genre | 'untagged';
   /** 只看最近添加 */
@@ -191,6 +194,14 @@ export interface BrowseResult {
 export type CatalogEntry = { workKey?: string } & ({ kind: 'series'; series: SeriesSummary } | { kind: 'item'; item: MediaItem });
 
 /* ------------------------------ 播放 ------------------------------ */
+
+export interface VideoSurfaceBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  scale: number;
+}
 
 export interface PlaybackTarget {
   itemId: string;

@@ -5,6 +5,7 @@ type Unsubscribe = () => void;
 
 const api = {
   channel: IPC,
+  inlineVideo: process.platform === 'win32',
   invoke<T = unknown>(channel: string, payload?: unknown): Promise<T> {
     return ipcRenderer.invoke(channel, payload) as Promise<T>;
   },

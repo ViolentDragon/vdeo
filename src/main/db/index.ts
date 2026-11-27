@@ -1,5 +1,7 @@
 import { openDatabase, type SqliteHandle, type SqlValue } from './sqlite';
-import { DDL_V1, DDL_V2, DDL_V3, SCHEMA_VERSION } from './schema';
+import { DDL_V1, DDL_V2, DDL_V3, DDL_V4, DDL_V5, SCHEMA_VERSION, WORK_KEY } from './schema';
+import { TMDB_CREDENTIAL_KEY, type TmdbMetadata, type TmdbWork } from '../metadata/tmdb';
+import { NUMBERED_TITLE_PREFIX, parseMediaFile } from '../scan/namer';
 import type {
   AppSettings,
   BrowseQuery,
@@ -33,10 +35,6 @@ const EPISODE_KEY = 'COALESCE(season, 1), COALESCE(episode, -1), COALESCE(episod
 const FILE_PREFERENCE = `CASE resolution WHEN '2160p' THEN 4 WHEN '1080p' THEN 3 WHEN '720p' THEN 2 ELSE 1 END DESC,
                          size DESC, id`;
 const FIRST_EPISODE_ORDER = 'CASE WHEN season = 0 THEN 1 ELSE 0 END, COALESCE(season, 1), episode IS NULL, episode, episode_end, id';
-const WORK_KEY = `CASE
-  WHEN series_key IS NOT NULL THEN 'series:' || series_key
-  WHEN section = 'movie' THEN 'movie:' || lower(replace(replace(trim(title), ' ', ''), '·', '')) || '#' || COALESCE(year, '')
-  ELSE id END`;
 
 function readGenres(value: unknown): Genre[] {
   const entries: unknown = JSON.parse(mustStr(value, '[]'));
@@ -54,7 +52,7 @@ function rowToItem(row: Row): MediaItem {
     mtime: mustNum(row['mtime']),
     section: (mustStr(row['section'], 'other') as LibrarySection) || 'other',
     title: mustStr(row['title']),
-    year: num(row['year']),
+    year: num(row['display_year']),
     season: num(row['season']),
     episode: num(row['episode']),
     episodeEnd: num(row['episode_end']),
@@ -67,11 +65,12 @@ function rowToItem(row: Row): MediaItem {
     audioCodec: str(row['audio_codec']),
     releaseGroup: str(row['release_group']),
     confidence: mustNum(row['confidence']),
-    poster: str(row['poster']),
+    poster: str(row['display_poster']),
     posterItemId: str(row['poster_item_id']),
-    backdrop: str(row['backdrop']),
-    overview: str(row['overview']),
-    rating: num(row['rating']),
+    searchAlias: str(row['search_alias']),
+    backdrop: str(row['display_backdrop']),
+    overview: str(row['display_overview']),
+    rating: num(row['display_rating']),
     durationSec: num(row['duration_sec']),
     width: num(row['width']),
     height: num(row['height']),
@@ -117,6 +116,7 @@ const ITEM_COLUMNS = [
   'episode_end',
   'series_key',
   'series_title',
+  'search_alias',
   'genres',
   'resolution',
   'quality',
@@ -154,6 +154,7 @@ function itemValues(it: MediaItem): SqlValue[] {
     it.episodeEnd,
     it.seriesKey,
     it.seriesTitle,
+    it.searchAlias ?? null,
     JSON.stringify(it.genres ?? []),
     it.resolution,
     it.quality,
@@ -195,6 +196,7 @@ ON CONFLICT(source_id, path) DO UPDATE SET
   episode_end = excluded.episode_end,
   series_key = excluded.series_key,
   series_title = excluded.series_title,
+  search_alias = COALESCE(excluded.search_alias, items.search_alias),
   genres = excluded.genres,
   resolution = excluded.resolution,
   quality = excluded.quality,
@@ -242,23 +244,70 @@ export interface Repository {
   clearPlayback(itemId: string): void;
   continueWatching(limit: number): Array<{ item: MediaItem; record: PlaybackRecord }>;
 
+  listTmdbWorks(sourceIds: string[] | null, retryBefore: number): TmdbWork[];
+  saveTmdbMetadata(workKey: string, metadata: TmdbMetadata | null): void;
+
   getAllSettings(): Partial<AppSettings>;
+  getSetting(key: string): unknown;
   setSetting(key: string, value: unknown): void;
+}
+
+function searchWords(value: string): string[] {
+  return value.normalize('NFKC').toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+function matchesLibrarySearch(query: SqlValue, title: SqlValue, series: SqlValue, name: SqlValue, alias: SqlValue): number {
+  const fields = [title, series, name, alias].filter((field): field is string => typeof field === 'string');
+  const keys = fields.map((field) => searchWords(field).join(''));
+  return Number(String(query).split(' ').every((word) => keys.some((key) => key.includes(word))));
+}
+
+function repairNumberedMovieTitles(db: SqliteHandle): void {
+  const candidates = db.prepare("SELECT id, name, path, title, episode, series_key FROM items WHERE series_key IS NOT NULL AND name GLOB '[1-9]*'").all();
+  const update = db.prepare(`UPDATE items SET section = 'movie', title = ?, year = ?, search_alias = ?,
+    season = NULL, episode = NULL, episode_end = NULL, series_key = NULL, series_title = NULL WHERE id = ?`);
+  const updatePlayback = db.prepare('UPDATE playback SET series_key = NULL WHERE item_id = ?');
+  const copyGenres = db.prepare(`INSERT OR IGNORE INTO work_genres (work_key, genres)
+    SELECT (${WORK_KEY}), work_genres.genres FROM items JOIN work_genres ON work_genres.work_key = ?
+    WHERE items.id = ?`);
+
+  for (const row of candidates) {
+    const name = mustStr(row['name']);
+    const prefix = name.match(NUMBERED_TITLE_PREFIX)?.[0];
+    if (!prefix || Number(prefix) !== num(row['episode'])) continue;
+
+    const parsed = parseMediaFile({ fullPath: mustStr(row['path']), fileName: name });
+    if (parsed.section !== 'movie' || parsed.year === null || (!parsed.quality && !parsed.resolution)) continue;
+
+    const id = mustStr(row['id']);
+    const previousTitle = str(row['title']);
+    update.run(parsed.title, parsed.year, previousTitle !== parsed.title ? previousTitle : null, id);
+    updatePlayback.run(id);
+    copyGenres.run('series:' + mustStr(row['series_key']), id);
+  }
 }
 
 export function createRepository(file: string): Repository {
   const db = openDatabase(file);
+  db.exec('PRAGMA busy_timeout = 5000');
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA synchronous = NORMAL');
   db.exec('PRAGMA foreign_keys = ON');
+  db.function('library_search', { deterministic: true }, matchesLibrarySearch);
 
   const version = mustNum(db.prepare('PRAGMA user_version').get()?.['user_version'], 0);
   if (version < SCHEMA_VERSION) {
-    db.exec('BEGIN');
+    db.exec('BEGIN IMMEDIATE');
     try {
-      if (version < 1) db.exec(DDL_V1);
-      if (version < 2) db.exec(DDL_V2);
-      if (version < 3) db.exec(DDL_V3);
+      const currentVersion = mustNum(db.prepare('PRAGMA user_version').get()?.['user_version'], 0);
+      if (currentVersion < 1) db.exec(DDL_V1);
+      if (currentVersion < 2) db.exec(DDL_V2);
+      if (currentVersion < 3) db.exec(DDL_V3);
+      if (currentVersion < 4) {
+        db.exec(DDL_V4);
+        repairNumberedMovieTitles(db);
+      }
+      if (currentVersion < 5) db.exec(DDL_V5);
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       db.exec('COMMIT');
     } catch (err) {
@@ -268,6 +317,13 @@ export function createRepository(file: string): Repository {
   }
 
   const upsertStmt = db.prepare(UPSERT_ITEM_SQL);
+  const saveTmdbMetadataStmt = db.prepare(`
+    INSERT INTO tmdb_metadata VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (tmdb_work_key) DO UPDATE SET tmdb_id = excluded.tmdb_id, tmdb_year = excluded.tmdb_year,
+      tmdb_poster = excluded.tmdb_poster, tmdb_backdrop = excluded.tmdb_backdrop,
+      tmdb_overview = excluded.tmdb_overview, tmdb_rating = excluded.tmdb_rating, checked_at = excluded.checked_at
+    WHERE tmdb_metadata.tmdb_id IS NULL
+  `);
 
   const tx = <T>(fn: () => T): T => {
     db.exec('BEGIN');
@@ -373,7 +429,7 @@ export function createRepository(file: string): Repository {
     },
 
     getItem(id) {
-      const row = db.prepare('SELECT * FROM items WHERE id = ?').get(id);
+      const row = db.prepare('SELECT * FROM library_items WHERE id = ?').get(id);
       return row ? rowToItem(row) : null;
     },
 
@@ -381,13 +437,15 @@ export function createRepository(file: string): Repository {
       if (ids.length === 0) return [];
       const placeholders = ids.map(() => '?').join(', ');
       return db
-        .prepare(`SELECT * FROM items WHERE id IN (${placeholders})`)
+        .prepare(`SELECT * FROM library_items WHERE id IN (${placeholders})`)
         .all(...(ids as SqlValue[]))
         .map(rowToItem);
     },
 
     browse(query) {
-      const group = query.group ?? 'item';
+      const search = [...new Set(searchWords(query.search ?? ''))].join(' ');
+      const videoSearch = Boolean(search) && (!query.section || ['movie', 'tv', 'anime'].includes(query.section));
+      const group = videoSearch && query.group !== 'series' ? 'catalog' : (query.group ?? 'item');
       const scope = ['missing = 0'];
       const scopeParams: SqlValue[] = [];
       if (query.section) {
@@ -404,10 +462,12 @@ export function createRepository(file: string): Repository {
 
       const filters: string[] = [];
       const filterParams: SqlValue[] = [];
-      if (query.search?.trim()) {
-        const like = `%${query.search.trim().replace(/[\\%_]/g, '\\$&')}%`;
-        filters.push("(title LIKE ? ESCAPE '\\' OR series_title LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')");
-        filterParams.push(like, like, like);
+      if (search) {
+        filters.push('library_search(?, title, series_title, name, search_alias) = 1');
+        filterParams.push(search);
+      } else if (query.search?.trim()) {
+        filters.push('instr(name, ?) > 0');
+        filterParams.push(query.search.trim());
       }
       const genreColumn = group === 'item' ? 'genres' : 'effective_genres';
       if (query.genre === 'untagged') {
@@ -419,8 +479,8 @@ export function createRepository(file: string): Repository {
       const orderCol = {
         added: 'added_at',
         title: 'title',
-        year: 'year',
-        rating: 'rating',
+        year: 'display_year',
+        rating: 'display_rating',
         episode: 'episode',
       }[query.sort ?? 'added'];
       const order = query.order === 'asc' ? 'ASC' : 'DESC';
@@ -432,7 +492,7 @@ export function createRepository(file: string): Repository {
           ? [...filters.slice(0, -1), 'work_key NOT IN (SELECT work_key FROM scoped WHERE json_array_length(effective_genres) > 0)']
           : filters;
         const cte = `WITH candidates AS (
-          SELECT *, ${WORK_KEY} AS work_key FROM items WHERE ${scope.join(' AND ')}
+          SELECT * FROM library_items WHERE ${scope.join(' AND ')}
         ), scoped AS (
           SELECT candidates.*, COALESCE(work_genres.genres, candidates.genres) AS effective_genres
           FROM candidates LEFT JOIN work_genres USING (work_key)
@@ -451,12 +511,12 @@ export function createRepository(file: string): Repository {
         ), cards AS (
           SELECT work_key, MAX(series_key) AS sk, MAX(CASE WHEN cover_rank = 1 THEN id END) AS artwork_id,
                  COALESCE(MAX(series_title), MAX(title)) AS title,
-                 MIN(year) AS year, MAX(section) AS section,
+                 MIN(display_year) AS display_year, MAX(section) AS section,
                  GROUP_CONCAT(DISTINCT source_id) AS source_ids,
                  COUNT(*) AS episode_count, COUNT(DISTINCT COALESCE(season, 1)) AS season_count,
                  GROUP_CONCAT(DISTINCT COALESCE(season, 1)) AS seasons,
-                 MAX(added_at) AS added_at, MAX(rating) AS rating, MIN(episode) AS episode,
-                 MAX(poster) AS poster
+                 MAX(added_at) AS added_at, MAX(display_rating) AS display_rating, MIN(episode) AS episode,
+                 MAX(display_poster) AS poster, MAX(display_overview) AS overview
           FROM preferred GROUP BY work_key
           ORDER BY ${orderCol} ${order}, title ASC, work_key ASC LIMIT ? OFFSET ?
         ) SELECT cards.*,
@@ -495,7 +555,7 @@ export function createRepository(file: string): Repository {
       const total = mustNum(db.prepare(`SELECT COUNT(*) AS c FROM items WHERE ${whereSql}`).get(...params)?.['c']);
       const items = db
         .prepare(
-          `SELECT * FROM items WHERE ${whereSql} ORDER BY ${orderCol} ${order}, title ASC LIMIT ? OFFSET ?`,
+          `SELECT * FROM library_items WHERE ${whereSql} ORDER BY ${orderCol} ${order}, title ASC LIMIT ? OFFSET ?`,
         )
         .all(...params, limit, offset)
         .map(rowToItem);
@@ -506,8 +566,8 @@ export function createRepository(file: string): Repository {
       const rows = db
         .prepare(
           `WITH ranked AS (
-             SELECT items.*, ROW_NUMBER() OVER (PARTITION BY ${EPISODE_KEY} ORDER BY ${FILE_PREFERENCE}) AS preference
-             FROM items WHERE series_key = ? AND missing = 0
+             SELECT library_items.*, ROW_NUMBER() OVER (PARTITION BY ${EPISODE_KEY} ORDER BY ${FILE_PREFERENCE}) AS preference
+             FROM library_items WHERE series_key = ? AND missing = 0
            ) SELECT * FROM ranked WHERE preference = 1 ORDER BY ${FIRST_EPISODE_ORDER}`,
         )
         .all(key)
@@ -515,9 +575,10 @@ export function createRepository(file: string): Repository {
       if (rows.length === 0) return null;
       const first = rows[0]!;
       const seasons = [...new Set(rows.map((r) => r.season ?? 1))].sort((a, b) => a - b);
-      const info = db.prepare(`SELECT MIN(year) AS year, MAX(poster) AS poster, MAX(added_at) AS added_at,
-                               GROUP_CONCAT(DISTINCT source_id) AS source_ids
-                               FROM items WHERE series_key = ? AND missing = 0`).get(key);
+      const info = db.prepare(`SELECT MIN(display_year) AS year, MAX(display_poster) AS poster,
+                               MAX(display_overview) AS overview, MAX(display_rating) AS rating,
+                               MAX(added_at) AS added_at, GROUP_CONCAT(DISTINCT source_id) AS source_ids
+                               FROM library_items WHERE series_key = ? AND missing = 0`).get(key);
       const posterItemId = db.prepare(`SELECT poster_item_id FROM items
         WHERE series_key = ? AND missing = 0 AND poster_item_id IS NOT NULL
         ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, poster_item_id LIMIT 1`).get(key, first.id);
@@ -534,6 +595,8 @@ export function createRepository(file: string): Repository {
         seasonCount: seasons.length,
         seasons,
         poster: str(info?.['poster']),
+        overview: str(info?.['overview']),
+        rating: num(info?.['rating']),
         posterItemId: str(posterItemId?.['poster_item_id']),
         artworkId: first.id,
         genres: override ? readGenres(override['genres']) : GENRES.filter((genre) => genres.includes(genre)),
@@ -651,9 +714,43 @@ export function createRepository(file: string): Repository {
       return out;
     },
 
+    listTmdbWorks(sourceIds, retryBefore) {
+      return db.prepare(`
+        WITH works AS (
+          SELECT ${WORK_KEY} AS work_key, series_key, MIN(COALESCE(series_title, title)) AS title, MIN(year) AS year
+          FROM items
+          WHERE missing = 0 AND section IN ('movie', 'tv', 'anime') AND (
+            ? IS NULL OR source_id IN (SELECT value FROM json_each(?))
+          )
+          GROUP BY work_key, series_key
+        )
+        SELECT works.* FROM works LEFT JOIN tmdb_metadata ON tmdb_work_key = work_key
+        WHERE tmdb_work_key IS NULL OR (tmdb_id IS NULL AND checked_at < ?)
+        ORDER BY work_key
+      `).all(sourceIds === null ? null : 1, JSON.stringify(sourceIds), retryBefore).map((row) => {
+        const seriesKey = str(row['series_key']);
+        return {
+          workKey: mustStr(row['work_key']),
+          kind: seriesKey ? 'tv' : 'movie',
+          title: mustStr(row['title']),
+          year: seriesKey ? num(seriesKey.slice(seriesKey.lastIndexOf('#') + 1)) : num(row['year']),
+        };
+      });
+    },
+
+    saveTmdbMetadata(workKey, metadata) {
+      saveTmdbMetadataStmt.run(workKey, metadata?.id ?? null, metadata?.year ?? null, metadata?.poster ?? null, metadata?.backdrop ?? null,
+        metadata?.overview ?? null, metadata?.rating ?? null, Date.now());
+    },
+
+    getSetting(key) {
+      const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+      return row ? JSON.parse(mustStr(row['value'], 'null')) as unknown : undefined;
+    },
+
     getAllSettings() {
       const out: Record<string, unknown> = {};
-      for (const row of db.prepare('SELECT key, value FROM settings').all()) {
+      for (const row of db.prepare('SELECT key, value FROM settings WHERE key != ?').all(TMDB_CREDENTIAL_KEY)) {
         try {
           out[mustStr(row['key'])] = JSON.parse(mustStr(row['value'], 'null'));
         } catch {
@@ -684,13 +781,15 @@ function rowToSeries(row: Row): SeriesSummary {
   return {
     key: mustStr(row['sk']),
     title: mustStr(row['title']),
-    year: num(row['year']),
+    year: num(row['display_year']),
     section: (mustStr(row['section'], 'tv') as LibrarySection) || 'tv',
     sourceIds: (str(row['source_ids']) ?? '').split(',').filter(Boolean),
     episodeCount: mustNum(row['episode_count']),
     seasonCount: mustNum(row['season_count']),
     seasons,
     poster: str(row['poster']),
+    overview: str(row['overview']),
+    rating: num(row['display_rating']),
     posterItemId: str(row['poster_item_id']),
     artworkId: mustStr(row['artwork_id']),
     genres: readGenres(row['genres']),

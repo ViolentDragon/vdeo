@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRepository } from '../src/main/db';
+import { openDatabase } from '../src/main/db/sqlite';
 import { LocalProvider } from '../src/main/sources/local';
 import { scanSource } from '../src/main/scan/scanner';
 import type { StorageSource } from '../src/shared/types';
@@ -21,6 +22,69 @@ function makeSource(root: string): StorageSource {
     createdAt: Date.now(),
   };
 }
+
+test('搜索聚合为作品，并能用中英文找回数字开头的电影', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nebula-search-'));
+  const film = join(root, '三傻大闹宝莱坞 (原盘 蓝光)');
+  mkdirSync(film);
+  writeFileSync(join(film, '3.Idiots.2009.1080p.BluRay.REMUX.AVC.DTS-HD.MA.5.1-FGT.mkv'), 'x');
+  writeFileSync(join(root, '峡谷之城.S01E01.mkv'), 'x');
+  writeFileSync(join(root, '峡谷之城.S01E02.mkv'), 'x');
+
+  const dbFile = join(root, 'test.db');
+  let repo = createRepository(dbFile);
+  try {
+    const source = makeSource(root);
+    repo.insertSource(source);
+    const provider = new LocalProvider([root]);
+    const scan = () => scanSource({ source, provider, repo, ignorePatterns: [] });
+    assert.equal((await scan()).found, 3);
+    const search = () => {
+      for (const term of ['3 Idiots', '３．Ｉｄｉｏｔｓ', '3Idiots', '三傻大闹宝莱坞（3 Idiots）']) {
+        const result = repo.browse({ section: 'movie', search: term });
+        assert.equal(result.total, 1, term);
+        assert.equal(result.entries?.[0]?.kind, 'item', term);
+        assert.equal(result.items[0]?.title, '3 Idiots', term);
+        assert.equal(result.items[0]?.episode, null, term);
+      }
+    };
+    search();
+
+    const result = repo.browse({ group: 'item', search: '峡谷之城 E02' });
+    assert.equal(result.total, 1);
+    assert.equal(result.items.length, 0);
+    const show = result.entries?.[0];
+    assert.ok(show?.kind === 'series');
+    assert.equal(show.series.episodeCount, 2);
+    assert.equal(repo.getSeries(show.series.key)?.items.length, 2);
+
+    const movieId = repo.browse({ section: 'movie' }).items[0]!.id;
+    const oldKey = 'tv:三傻大闹宝莱坞#unknown';
+    repo.savePlayback({ itemId: movieId, seriesKey: oldKey, position: 100, duration: 600, finished: false, updatedAt: Date.now() });
+    repo.close();
+
+    const legacy = openDatabase(dbFile);
+    try {
+      legacy.exec('DROP VIEW library_items; DROP TABLE tmdb_metadata; ALTER TABLE items DROP COLUMN search_alias; PRAGMA user_version = 3');
+      legacy.prepare("UPDATE items SET section = 'tv', title = '三傻大闹宝莱坞', series_title = title, season = 1, episode = 3, series_key = ? WHERE id = ?")
+        .run(oldKey, movieId);
+      legacy.prepare("INSERT INTO work_genres (work_key, genres) VALUES (?, ?)").run('series:' + oldKey, '["喜剧"]');
+    } finally {
+      legacy.close();
+    }
+    repo = createRepository(dbFile);
+    search();
+    assert.equal(repo.getPlayback(movieId)?.position, 100);
+    assert.equal(repo.getPlayback(movieId)?.seriesKey, null);
+    assert.equal(repo.browse({ group: 'catalog', genre: '喜剧', search: '3 idiots' }).total, 1);
+    assert.equal(repo.getSeries(oldKey), null);
+    await scan();
+    search();
+  } finally {
+    repo.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('端到端：真实目录 → 扫描 → 入库 → 分区与剧集聚合 → 重扫幂等', async () => {
   const root = mkdtempSync(join(tmpdir(), 'nebula-e2e-'));

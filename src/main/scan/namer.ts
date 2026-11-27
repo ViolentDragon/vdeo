@@ -105,6 +105,7 @@ const GENRE_RULES: Array<[Genre, RegExp]> = [
   ['纪录片', /纪录片|紀錄片|纪实|紀實|\bdocumentar(?:y|ies)\b/i], ['综艺', /综艺|綜藝|真人秀|\breality show\b/i],
 ];
 const GENERIC_FOLDER = /^(?:tv|series|movies?|films?|videos?|media|剧集|电视剧|電視劇|电视剧资源|电影|電影|视频资源|視頻資源|动漫|动画|番剧|综艺|纪录片|国产剧|国剧|陆剧|港剧|美剧|日剧|韩剧|下载|资源库|合集)$/i;
+export const NUMBERED_TITLE_PREFIX = /^[1-9]\d{0,2}(?=[\s._-])/;
 const YEAR_PATTERN = /(?:^|[^\d])((?:19|20)\d{2})(?:[^\d]|$)/;
 
 function mediaNumber(text: string): number {
@@ -189,7 +190,7 @@ type EpisodeHit = {
   length: number;
 };
 
-function findEpisode(text: string, allowAnimeDash: boolean): EpisodeHit | null {
+function findEpisode(text: string, allowAnimeDash: boolean, seasonHint: number | null): EpisodeHit | null {
   // S01E02 / S01E02E03 / S01E02-E04
   const sxxexx = text.match(/s(\d{1,2})[ ._-]*e(\d{1,4})(?!\d)(?:[ ._-]*e(\d{1,4})(?!\d))?/i);
   if (sxxexx?.index !== undefined) {
@@ -254,14 +255,15 @@ function findEpisode(text: string, allowAnimeDash: boolean): EpisodeHit | null {
     }
   }
 
-  // 纯数字文件名：04.mkv / 第4集 之外的 "04 - 标题"
-  const bare = text.match(/^(\d{1,3})(?:v\d)?(?=\s|[._-]|$)/);
-  if (bare?.index !== undefined) {
+  // 有歧义的前导数字需要集号格式或季目录，例如 3.Idiots 的 3 属于片名。
+  const bare = text.match(/^(\d{1,3})(?:v\d)?(?=\s|[._–—-]|$)/);
+  const rest = bare ? text.slice(bare[0].length) : '';
+  if (bare && (!rest || /^\s*[-–—]\s+/.test(rest) || /^0\d/.test(bare[1]!) || seasonHint !== null)) {
     return {
       season: null,
       episode: Number(bare[1]),
       episodeEnd: null,
-      index: bare.index,
+      index: 0,
       length: bare[0].length,
     };
   }
@@ -295,13 +297,20 @@ export function parseMediaFile(input: ParseInput): ParsedMedia {
   }
 
   const dirInfo = titleFromDirs(input.fullPath);
-  const ep = findEpisode(base, animeContext);
+  const ep = findEpisode(base, animeContext, dirInfo.season);
 
   const episode = ep?.episode ?? null;
   const episodeEnd = ep?.episodeEnd ?? null;
 
-  // 标题：优先取集号标记之前的文本
-  let titleSource = ep ? base.slice(0, ep.index) : base;
+  const yearSource = ep ? base.slice(0, ep.index) : base;
+  const yearMatch = yearSource.match(YEAR_PATTERN) ?? (ep ? base.slice(ep.index + ep.length).match(YEAR_PATTERN) : null);
+  let year = yearMatch?.[1] ? Number(yearMatch[1]) : null;
+
+  // 数字开头的发布名以年份分隔片名和后续技术标签。
+  let titleSource = yearSource;
+  if (!ep && (quality || resolution) && NUMBERED_TITLE_PREFIX.test(base) && yearMatch?.index) {
+    titleSource = base.slice(0, yearMatch.index).replace(/[\s([（【]+$/, '');
+  }
   if (releaseGroup) {
     const suffix = `-${releaseGroup}`;
     const gi = titleSource.lastIndexOf(suffix);
@@ -314,18 +323,13 @@ export function parseMediaFile(input: ParseInput): ParsedMedia {
   let title = namedSeason.title;
   let titleFromDir = false;
 
-  // 年份：在集号之前的部分里找，避免把集号误当年份
-  const yearSource = ep ? base.slice(0, ep.index) : base;
-  const yearMatch = yearSource.match(YEAR_PATTERN) ?? (ep ? base.slice(ep.index + ep.length).match(YEAR_PATTERN) : null);
-  let year = yearMatch?.[1] ? Number(yearMatch[1]) : null;
-
   // 「1917」这类片名会被年份规则吃掉：标题为空时视为片名
   if (!ep && year !== null && title.length === 0) {
     title = String(year);
     year = null;
   }
 
-  if (title.length < 2) {
+  if (!title || (ep && title.length < 2)) {
     title = dirInfo.title || title || base;
     titleFromDir = title === dirInfo.title && dirInfo.title.length > 0;
   }

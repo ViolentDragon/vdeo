@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import {
   DEFAULT_PLAYER_CONFIG,
   GENRES,
@@ -22,14 +22,23 @@ import {
 } from '../shared/types';
 import { CLOUD_DRIVES, type CloudDriveId } from '../shared/drives';
 import { IPC } from '../shared/ipc-contract';
+import { PLAYBACK_SHORTCUTS } from '../shared/playback-shortcuts';
 import { call, Icon, PageHeading, type IconName } from './ui';
 import { LocalPathPicker } from './LocalPathPicker';
 import { ScanScopePage } from './ScanScopePage';
+import { InlineVideo } from './InlineVideo';
+import { api, isBrowserPreview } from './api';
+import { TmdbAttribution, TmdbSettings } from './TmdbSettings';
+import { usePointerMotion } from './motion';
 
-const api = window.nebula;
 const PAGE_SIZE = 36;
 type GenreFilter = Genre | 'untagged' | '';
 type GenreEditTarget = { workKey: string; title: string; genres: Genre[] };
+type SeriesData = { summary: SeriesSummary; items: MediaItem[] };
+type ResumePoint = { item: MediaItem; position: number };
+type SeriesPageData = SeriesData & { resume?: ResumePoint };
+type WatchSelection = { item: MediaItem; series: SeriesData | null };
+type ViewPosition = { top: number; trigger: HTMLElement | null; key?: string };
 
 type NavKey = LibrarySection | 'all' | 'continue' | 'sources' | 'settings';
 type AddSourceSelection = 'cloud' | 'local' | 'webdav' | CloudDriveId;
@@ -37,7 +46,8 @@ type Subpage =
   | { kind: 'add'; selection: AddSourceSelection }
   | { kind: 'browse'; source: StorageSource }
   | { kind: 'scan-scope'; source: StorageSource }
-  | { kind: 'genre'; target: GenreEditTarget };
+  | { kind: 'genre'; target: GenreEditTarget }
+  | { kind: 'movie'; item: MediaItem };
 
 function sourceDriveId(source: StorageSource): CloudDriveId | undefined {
   if (source.config.kind === 'aliyun') return 'aliyun';
@@ -59,9 +69,31 @@ const NAV: Array<{ key: NavKey; label: string; icon: IconName }> = [
 ];
 
 const MANAGEMENT_NAV = [
-  { key: 'sources', label: '存储源' },
-  { key: 'settings', label: '设置' },
+  { key: 'sources', label: '存储源', icon: 'sources' },
+  { key: 'settings', label: '设置', icon: 'settings' },
 ] as const;
+
+function RailGroup({ items, current, label, sourceCount, onNavigate }: {
+  items: ReadonlyArray<{ key: NavKey; label: string; icon: IconName }>;
+  current: NavKey;
+  label: string;
+  sourceCount?: number;
+  onNavigate: (nav: NavKey) => void;
+}) {
+  const active = items.findIndex(({ key }) => current === key);
+  return <nav className="nav" aria-label={label}>
+    <div className="nav__items" style={{ '--active-index': Math.max(0, active) } as CSSProperties}>
+      <span className="nav__indicator" data-active={active !== -1} aria-hidden="true" />
+      {items.map(({ key, label: title, icon }) => <button key={key}
+        className={'nav__item' + (current === key ? ' is-active' : '')}
+        aria-current={current === key ? 'page' : undefined} title={title} onClick={() => onNavigate(key)}>
+        <Icon name={icon} />
+        <span className="nav__label">{title}</span>
+        {key === 'sources' && sourceCount ? <span className="nav__count">{sourceCount}</span> : null}
+      </button>)}
+    </div>
+  </nav>;
+}
 
 const SCAN_STAGE: Record<ScanProgress['phase'], string> = {
   connecting: '正在连接', listing: '正在遍历', parsing: '正在识别媒体',
@@ -91,16 +123,16 @@ function epLabel(item: MediaItem): string {
 
 function Poster({ item, big }: { item: MediaItem | SeriesSummary | null; big?: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
-  const [loaded, setLoaded] = useState<{ owner: string; url: string; poster: boolean } | null>(null);
+  const [loaded, setLoaded] = useState<{ owner: string; posterId: string | null; url: string; poster: boolean } | null>(null);
   const [invalid, setInvalid] = useState<string | null>(null);
   const [invalidPosterItem, setInvalidPosterItem] = useState<string | null>(null);
   const id = item && ('artworkId' in item ? item.artworkId : item.id);
   const poster = item?.poster !== invalid ? item?.poster : null;
-  const posterId = item?.posterItemId !== invalidPosterItem ? item?.posterItemId : null;
+  const posterId = item?.posterItemId !== invalidPosterItem ? item?.posterItemId ?? null : null;
   const title = item?.title ?? '';
   const hue = [...title].reduce((sum, char) => (sum * 11 + (char.codePointAt(0) ?? 0)) % 360, 42);
   useEffect(() => {
-    if (!id || poster || !ref.current) return;
+    if (!id || (poster && !posterId) || !ref.current) return;
     let live = true;
     const observer = new IntersectionObserver(([entry]) => {
       if (!entry?.isIntersecting) return;
@@ -109,8 +141,8 @@ function Poster({ item, big }: { item: MediaItem | SeriesSummary | null; big?: b
       void (async () => {
         const sidecar = posterId ? await load(posterId) : null;
         if (!live) return;
-        const url = sidecar ?? await load(id);
-        if (live && url) setLoaded({ owner: id, url, poster: Boolean(sidecar) });
+        const url = sidecar ?? (poster ? null : await load(id));
+        if (live && url) setLoaded({ owner: id, posterId, url, poster: Boolean(sidecar) });
       })();
     }, { rootMargin: '120px' });
     observer.observe(ref.current);
@@ -119,22 +151,23 @@ function Poster({ item, big }: { item: MediaItem | SeriesSummary | null; big?: b
       observer.disconnect();
     };
   }, [id, poster, posterId]);
-  const remote = loaded?.owner === id && loaded.url !== invalid ? loaded : null;
-  const src = poster || remote?.url;
+  const remote = loaded?.owner === id && loaded.posterId === posterId && loaded.url !== invalid ? loaded : null;
+  const src = (remote?.poster ? remote.url : poster) || remote?.url;
   const promotional = Boolean(poster || remote?.poster);
   return (
     <div ref={ref} className={`poster ${big ? 'poster--big' : ''} ${promotional ? 'poster--artwork' : ''}`} style={{ '--poster-hue': hue } as React.CSSProperties} aria-hidden="true">
       {src ? <img src={src} alt="" loading="lazy" onError={() => {
         setInvalid(src);
-        if (!poster && remote?.poster && posterId) setInvalidPosterItem(posterId);
+        if (remote?.poster && posterId) setInvalidPosterItem(posterId);
       }} /> : (
-        <span className="poster__initial">{Array.from(title).slice(0, 2).join('')}</span>
+        <span className="poster__initial">{title}</span>
       )}
     </div>
   );
 }
 
 export default function App() {
+  const appMotion = usePointerMotion();
   const [nav, setNav] = useState<NavKey>('all');
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState<'added' | 'title' | 'year' | 'rating'>('added');
@@ -144,40 +177,58 @@ export default function App() {
   const [total, setTotal] = useState(0);
   const [sources, setSources] = useState<StorageSource[]>([]);
   const [continueList, setContinueList] = useState<Array<{ item: MediaItem; record: { position: number; duration: number } }>>([]);
-  const [detail, setDetail] = useState<{ summary: SeriesSummary; items: MediaItem[] } | null>(null);
+  const [detail, setDetail] = useState<SeriesPageData | null>(null);
   const [player, setPlayer] = useState<PlayerState | null>(null);
+  const [watch, setWatch] = useState<WatchSelection | null>(null);
   const [scan, setScan] = useState<ScanProgress | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, notify] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [libraryVersion, setLibraryVersion] = useState(0);
+  const [continueVersion, setContinueVersion] = useState(0);
   const [continueLoading, setContinueLoading] = useState(false);
   const [continueError, setContinueError] = useState<string | null>(null);
   const [detailPending, setDetailPending] = useState<string | null>(null);
   const [libraryError, setLibraryError] = useState<string | null>(null);
-  const [playError, setPlayError] = useState<{ id: string; message: string } | null>(null);
+  const [playError, setPlayError] = useState<{ item: MediaItem; message: string } | null>(null);
   const [subpage, setSubpage] = useState<Subpage | null>(null);
+  const inlineVideo = window.nebula?.inlineVideo === true;
+  const watching = watch !== null;
+  const watchPlayer = watch && player?.itemId === watch.item.id ? player : null;
+  const playbackFullscreen = watchPlayer?.fullscreen === true;
+  const playRequest = useRef(0);
+  const playActive = useRef(false);
+  const watchReturn = useRef<ViewPosition | null>(null);
   const workspace = useRef<HTMLDivElement>(null);
   const searchInput = useRef<HTMLInputElement>(null);
-  const subpageReturn = useRef<{ top: number; trigger: HTMLElement | null } | null>(null);
-  const detailReturn = useRef<{ top: number; trigger: HTMLElement | null } | null>(null);
+  const subpageReturn = useRef<ViewPosition | null>(null);
+  const detailReturn = useRef<ViewPosition | null>(null);
   const libraryRequest = useRef(0);
   const detailRequest = useRef(0);
 
   const refreshLibrary = useCallback(() => setLibraryVersion((value) => value + 1), []);
   const isCatalog = nav === 'all' || nav === 'movie' || nav === 'tv' || nav === 'anime';
   const hasLibrary = nav !== 'sources' && nav !== 'settings' && nav !== 'continue';
-  const catalogTools = hasLibrary && !detail && !subpage;
+  const catalogTools = hasLibrary && !detail && !subpage && !watching;
   const scanning = scan && !['done', 'cancelled', 'error'].includes(scan.phase);
   const canScan = sources.some((source) => source.enabled && source.config.scanScope?.mode !== 'pending');
 
-  const capturePosition = () => ({
-    top: workspace.current?.scrollTop ?? 0,
-    trigger: document.activeElement instanceof HTMLElement ? document.activeElement : null,
-  });
+  const capturePosition = useCallback((): ViewPosition => {
+    const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return { top: workspace.current?.scrollTop ?? 0, trigger, key: trigger?.dataset.returnKey };
+  }, []);
+
+  const restorePosition = useCallback(({ top, trigger, key }: ViewPosition) => {
+    workspace.current?.scrollTo({ top, behavior: 'instant' });
+    const target = trigger?.isConnected ? trigger : key
+      ? workspace.current?.querySelector<HTMLElement>(`[data-return-key="${CSS.escape(key)}"]`)
+      : null;
+    target?.focus({ preventScroll: true });
+  }, []);
 
   const openSubpage = (next: Subpage) => {
+    if (watch) closeWatch();
     ++detailRequest.current;
     setDetailPending(null);
     subpageReturn.current = capturePosition();
@@ -189,22 +240,24 @@ export default function App() {
   useLayoutEffect(() => {
     if (subpage) workspace.current?.scrollTo({ top: 0, behavior: 'instant' });
     if (!subpage && subpageReturn.current) {
-      const { top, trigger } = subpageReturn.current;
+      restorePosition(subpageReturn.current);
       subpageReturn.current = null;
-      workspace.current?.scrollTo({ top, behavior: 'instant' });
-      trigger?.focus({ preventScroll: true });
     }
-  }, [subpage]);
+  }, [subpage, restorePosition]);
 
   useLayoutEffect(() => {
     if (detail && !subpage) workspace.current?.scrollTo({ top: 0, behavior: 'instant' });
     if (!detail && detailReturn.current) {
-      const { top, trigger } = detailReturn.current;
+      restorePosition(detailReturn.current);
       detailReturn.current = null;
-      workspace.current?.scrollTo({ top, behavior: 'instant' });
-      trigger?.focus({ preventScroll: true });
     }
-  }, [detail]);
+  }, [detail, restorePosition]);
+
+  useLayoutEffect(() => {
+    if (watching || !watchReturn.current) return;
+    restorePosition(watchReturn.current);
+    watchReturn.current = null;
+  }, [watching, restorePosition]);
 
   const loadSources = useCallback(async () => {
     try {
@@ -233,8 +286,9 @@ export default function App() {
         offset: page * PAGE_SIZE,
         group: isCatalog ? 'catalog' : 'item',
       };
-      if (nav !== 'all') query['section'] = nav;
-      if (search.trim()) query['search'] = search.trim();
+      const keyword = search.trim();
+      if (nav !== 'all' && (!isCatalog || !keyword)) query['section'] = nav;
+      if (keyword) query['search'] = keyword;
       if (isCatalog && genre) query['genre'] = genre;
       const res = await call<BrowseResult>(IPC.libraryBrowse, query);
       if (request !== libraryRequest.current) return;
@@ -267,7 +321,10 @@ export default function App() {
     void loadSources();
     void call<AppSettings>(IPC.settingsGet).then(setSettings).catch((err: Error) => notify(err.message));
     void call<{ mpvPath: string | null }>(IPC.mpvLocate).catch(() => undefined);
-  }, [loadSources]);
+    const refreshSources = () => { void loadSources(); };
+    window.addEventListener('focus', refreshSources);
+    return () => window.removeEventListener('focus', refreshSources);
+  }, [loadSources, notify]);
 
   useEffect(() => {
     if (!hasLibrary) return;
@@ -281,7 +338,7 @@ export default function App() {
 
   useEffect(() => {
     if (nav === 'continue') void loadContinue();
-  }, [nav, loadContinue]);
+  }, [nav, continueVersion, loadContinue]);
 
   useEffect(() => {
     const off1 = api.on<ScanProgress>(IPC.evScan, (p) => {
@@ -293,7 +350,9 @@ export default function App() {
         notify(`扫描失败：${p.message ?? '未知错误'}`);
       }
     });
-    const off2 = api.on<PlayerState>(IPC.evPlayer, (s) => setPlayer(s));
+    const off2 = api.on<PlayerState>(IPC.evPlayer, (s) => {
+      if (playActive.current) setPlayer(s);
+    });
     const off3 = api.on<{ reason: string }>(IPC.evLibrary, ({ reason }) => {
       refreshLibrary();
       if (reason === 'source-added') void loadSources();
@@ -305,22 +364,62 @@ export default function App() {
     };
   }, [notify, refreshLibrary, loadSources]);
 
-  const play = useCallback(
-    async (itemId: string) => {
-      setBusy(itemId);
-      setPlayError(null);
-      try {
-        const res = await call<{ mode: string; message: string }>(IPC.playItem, { itemId });
-        notify(res.message);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        setPlayError({ id: itemId, message });
-      } finally {
-        setBusy(null);
+  const stopPlayback = useCallback(() => {
+    if (!playActive.current) return;
+    playActive.current = false;
+    ++playRequest.current;
+    setWatch(null);
+    setPlayer(null);
+    setBusy(null);
+    setPlayError(null);
+    void call(IPC.playStop).then(() => setContinueVersion((version) => version + 1))
+      .catch((error: Error) => notify(error.message));
+  }, [notify]);
+
+  const closeWatch = () => {
+    stopPlayback();
+    detailReturn.current = null;
+    subpageReturn.current = null;
+    setDetail(null);
+    setSubpage(null);
+  };
+
+  const play = useCallback(async (item: MediaItem, series: SeriesData | null = null) => {
+    const request = ++playRequest.current;
+    playActive.current = true;
+    setBusy(item.id);
+    setPlayError(null);
+    const inApp = inlineVideo && settings?.player.engine !== 'external' &&
+      (item.section === 'movie' || item.section === 'tv' || item.section === 'anime');
+    if (inApp) {
+      watchReturn.current ??= detailReturn.current ?? subpageReturn.current ?? capturePosition();
+      setWatch({ item, series });
+      if (!series && item.seriesKey) {
+        void call<SeriesData | null>(IPC.librarySeries, { key: item.seriesKey }).then((data) => {
+          if (data && request === playRequest.current) setWatch({ item, series: data });
+        }).catch(() => undefined);
       }
-    },
-    [notify],
-  );
+    }
+    try {
+      const result = await call<{ mode: 'mpv' | 'external' | 'cancelled'; message: string }>(IPC.playItem, { itemId: item.id });
+      if (request !== playRequest.current) return;
+      if (result.mode === 'external') {
+        playActive.current = false;
+        watchReturn.current = null;
+        setWatch(null);
+        setPlayer(null);
+        notify(result.message);
+      } else if (result.mode === 'mpv' && !inApp) {
+        notify(result.message);
+      }
+    } catch (error) {
+      if (request === playRequest.current) {
+        setPlayError({ item, message: error instanceof Error ? error.message : String(error) });
+      }
+    } finally {
+      if (request === playRequest.current) setBusy(null);
+    }
+  }, [capturePosition, inlineVideo, notify, settings?.player.engine]);
 
   const playerCmd = useCallback(async (command: string, value?: number | string) => {
     try {
@@ -330,25 +429,25 @@ export default function App() {
     }
   }, []);
 
+  const canUsePlaybackKeys = player?.status === "playing" || player?.status === "paused";
+  const playerFullscreen = player?.fullscreen === true;
+
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement | null)?.tagName;
-      if (tag && ['INPUT', 'TEXTAREA', 'BUTTON', 'SELECT', 'A'].includes(tag)) return;
-      if (!player || player.status === 'idle') return;
-      if (e.code === 'Space') {
-        e.preventDefault();
-        void playerCmd('toggle-pause');
-      } else if (e.code === 'ArrowRight') {
-        void playerCmd('seek-relative', 10);
-      } else if (e.code === 'ArrowLeft') {
-        void playerCmd('seek-relative', -10);
-      } else if (e.code === 'KeyF') {
-        void playerCmd('fullscreen');
-      }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
+      const shortcut = PLAYBACK_SHORTCUTS.find(({ code }) => code === event.code);
+      if (!shortcut) return;
+      const exitFullscreen = shortcut.command === "exit-fullscreen";
+      if (exitFullscreen ? !playerFullscreen : !canUsePlaybackKeys) return;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (!exitFullscreen && (target?.isContentEditable || target?.closest("input, textarea, select"))) return;
+      if (event.code === "Space" && target?.closest("button, a, [role=button]")) return;
+      event.preventDefault();
+      if (!event.repeat || shortcut.repeat) void playerCmd(shortcut.command, shortcut.value);
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [player, playerCmd]);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [canUsePlaybackKeys, playerFullscreen, playerCmd]);
 
   const startScan = useCallback(
     async (sourceId?: string) => {
@@ -369,20 +468,28 @@ export default function App() {
     [notify, refreshLibrary, loadSources],
   );
 
-  const openSeries = async (key: string) => {
+  const openSeries = async (key: string, resume?: ResumePoint) => {
     const origin = capturePosition();
     const request = ++detailRequest.current;
     setDetailPending(key);
     try {
-      const res = await call<{ summary: SeriesSummary; items: MediaItem[] } | null>(IPC.librarySeries, { key });
+      const res = await call<SeriesData | null>(IPC.librarySeries, { key });
       if (request !== detailRequest.current) return;
       if (!res) throw new Error('该剧集已从影库移除');
       detailReturn.current = origin;
-      setDetail(res);
+      setDetail({ ...res, resume });
     } catch (err) {
       if (request === detailRequest.current) notify(err instanceof Error ? err.message : String(err));
     } finally {
       if (request === detailRequest.current) setDetailPending(null);
+    }
+  };
+
+  const openItem = (item: MediaItem, position?: number) => {
+    if (item.seriesKey) {
+      void openSeries(item.seriesKey, position === undefined ? undefined : { item, position });
+    } else {
+      void play(item);
     }
   };
 
@@ -402,6 +509,8 @@ export default function App() {
   }, [nav]);
 
   const changeNav = (next: NavKey) => {
+    watchReturn.current = null;
+    stopPlayback();
     ++detailRequest.current;
     subpageReturn.current = null;
     detailReturn.current = null;
@@ -435,44 +544,19 @@ export default function App() {
   }, [catalogTools]);
 
   return (
-    <div className="app">
+    <div ref={appMotion} className={playbackFullscreen ? "app app--playback-fullscreen" : "app"}>
       <div className="window-drag" aria-hidden="true" />
       <aside className="sidebar">
         <div className="brand">
           <span className="brand__mark"><Icon name="anime" /></span>
           <div>
             <div className="brand__name">Nebula</div>
-            <div className="brand__sub">星云影库</div>
+            <div className="brand__sub">{isBrowserPreview ? '浏览器版' : '星云影库'}</div>
           </div>
         </div>
 
-        <nav className="nav" aria-label="媒体库">
-          <div className="sidebar__title">媒体库</div>
-          {NAV.map((n) => (
-            <button
-              key={n.key}
-              className={`nav__item ${nav === n.key ? 'is-active' : ''}`}
-              aria-current={nav === n.key ? 'page' : undefined}
-              title={n.label}
-              onClick={() => changeNav(n.key)}
-            >
-              <Icon name={n.icon} />
-              <span className="nav__label">{n.label}</span>
-            </button>
-          ))}
-        </nav>
-
-        <nav className="nav nav--management" aria-label="管理">
-          <div className="sidebar__title">管理</div>
-          {MANAGEMENT_NAV.map(({ key, label }) => (
-            <button key={key} className={`nav__item ${nav === key ? 'is-active' : ''}`}
-              aria-current={nav === key ? 'page' : undefined} title={label} onClick={() => changeNav(key)}>
-              <Icon name={key} />
-              <span className="nav__label">{label}</span>
-              {key === 'sources' && sources.length > 0 ? <span className="nav__count">{sources.length}</span> : null}
-            </button>
-          ))}
-        </nav>
+        <RailGroup items={NAV} label="媒体库" current={nav} onNavigate={changeNav} />
+        <RailGroup items={MANAGEMENT_NAV} label="管理" current={nav} sourceCount={sources.length} onNavigate={changeNav} />
         <div className="sidebar__footer">
           <button className="btn sidebar__add" title="添加存储源" onClick={() => openAddSource('cloud')}>
             <Icon name="plus" /> <span>添加存储源</span>
@@ -481,10 +565,14 @@ export default function App() {
       </aside>
 
       <main className="main">
-        <header className="topbar">
+        {watch ? <WatchPage selection={watch} player={watchPlayer} opening={busy === watch.item.id}
+          error={playError?.item.id === watch.item.id ? playError.message : null}
+          onBack={closeWatch} onPlay={(item) => void play(item, watch.series)} onCommand={playerCmd} /> : null}
+
+        <header className="topbar" hidden={watching}>
           <div className="topbar__title">
             <Icon name={NAV.find((entry) => entry.key === nav)?.icon ?? (nav === 'settings' ? 'settings' : 'sources')} />
-            {navLabel}
+            <span key={nav} className="topbar__name">{navLabel}</span>
           </div>
           <div className="topbar__spacer" />
           {catalogTools ? <>
@@ -501,12 +589,12 @@ export default function App() {
               <option value="rating">按评分</option>
             </select>
           </> : null}
-          {!subpage ? <button className="btn btn--ghost scan-action" onClick={() => void startScan()} disabled={!canScan || Boolean(scanning)}>
+          {!subpage && !isBrowserPreview ? <button className="btn btn--ghost scan-action" onClick={() => void startScan()} disabled={!canScan || Boolean(scanning)}>
             <Icon name="scan" /> 扫描全部
           </button> : null}
         </header>
 
-        {scan && scanning ? (
+        {!watching && scan && scanning ? (
           <div className="scanbar" role="status">
             <span className="spinner" aria-hidden="true" />
             <span>
@@ -519,20 +607,20 @@ export default function App() {
           </div>
         ) : null}
 
-        {playError && !subpage ? <div className="play-error app-message" role="alert">
+        {playError && !subpage && !watching ? <div className="play-error app-message" role="alert">
           <span>{playError.message}</span>
-          <button className="btn btn--ghost btn--sm" onClick={() => void play(playError.id)}>重试播放</button>
+          <button className="btn btn--ghost btn--sm" onClick={() => void play(playError.item)}>重试播放</button>
           <button className="btn btn--icon" aria-label="关闭播放提示" onClick={() => setPlayError(null)}><Icon name="close" /></button>
         </div> : null}
 
         <div className="app-status" role="status">
-          {notice ? <div className="app-message">
+          {notice && !watching ? <div className="app-message">
             <span>{notice}</span>
             <button className="btn btn--icon" aria-label="关闭提示" onClick={() => notify(null)}><Icon name="close" /></button>
           </div> : null}
         </div>
 
-        <div className="workspace-scroll" ref={workspace}>
+        <div className="workspace-scroll" ref={workspace} hidden={watching}>
           <div className="workspace-page" hidden={Boolean(subpage)}>
         {nav === 'settings' ? (
           <SettingsPanel settings={settings} onSave={updateSettings} sources={sources} onOpenAddSource={openAddSource} />
@@ -552,18 +640,32 @@ export default function App() {
             onBrowse={(source) => openSubpage({ kind: 'browse', source })}
             onScope={(source) => openSubpage({ kind: 'scan-scope', source })}
           />
+        ) : detail ? (
+          <SeriesDetail
+            data={detail}
+            onBack={() => { stopPlayback(); setDetail(null); setPlayError(null); }}
+            onPlay={(item) => void play(item, detail)}
+            onEdit={() => openSubpage({ kind: 'genre', target: { workKey: `series:${detail.summary.key}`, title: detail.summary.title, genres: detail.summary.genres } })}
+            busy={busy}
+          />
         ) : nav === 'continue' ? (
           <section className="continue-view" aria-busy={continueLoading}>
             <PageHeading title="继续观看" icon="continue" description={continueList.length ? `${continueList.length} 项观看记录` : '从上次的播放位置继续'} />
             {continueError ? <div className="play-error" role="alert"><span>{continueError}</span><button className="btn btn--ghost" onClick={() => void loadContinue()}>重试</button></div>
-            : continueLoading ? <LoadingCards />
+            : continueLoading && !continueList.length ? <LoadingCards />
             : continueList.length === 0 ? (
               <Empty icon="continue" title="还没有观看记录" text="开始播放影片后，观看进度会保存在这里。"
                 action={<button className="btn btn--primary" onClick={() => changeNav('all')}>浏览影库 <Icon name="forward" /></button>} />
             ) : (
               <div className="catalog-grid">{continueList.map(({ item, record }) => (
-                <button key={item.id} className="card" disabled={busy === item.id} onClick={() => void play(item.id)}>
-                  <Poster item={item} />
+                <button key={item.id} className="card" data-motion="tilt" data-return-key={"continue:" + item.id}
+                  disabled={busy === item.id || Boolean(item.seriesKey && detailPending === item.seriesKey)}
+                  onClick={() => openItem(item, record.position)}>
+                  <div className="catalog-card__image">
+                    <Poster item={item} />
+                    <span className="card__shine" aria-hidden="true" />
+                    <span className="catalog-card__action" aria-hidden="true"><Icon name="play" /></span>
+                  </div>
                   <div className="card__body">
                     <div className="card__title">{item.seriesTitle ?? item.title}</div>
                     <div className="card__meta">
@@ -581,30 +683,26 @@ export default function App() {
               ))}</div>
             )}
           </section>
-        ) : detail ? (
-          <SeriesDetail
-            data={detail}
-            onBack={() => { setDetail(null); setPlayError(null); }}
-            onPlay={(id) => void play(id)}
-            onEdit={() => openSubpage({ kind: 'genre', target: { workKey: `series:${detail.summary.key}`, title: detail.summary.title, genres: detail.summary.genres } })}
-            busy={busy}
-          />
         ) : (
           <LibraryView key={nav} home={nav === 'all'} video={isCatalog} label={navLabel} entries={entries} sourceCount={sources.length}
             total={total} loading={loading} error={libraryError} search={search} genre={genre} page={page} busy={busy}
             detailPending={detailPending} onAddSource={() => openAddSource('cloud')} onSources={() => changeNav('sources')}
             onRetry={refreshLibrary} onGenre={(value) => { setGenre(value); setPage(0); }} onClear={() => { setSearch(''); setGenre(''); setPage(0); }}
-            onPage={setPage} onOpenSeries={(key) => void openSeries(key)} onPlay={(id) => void play(id)}
+            onPage={setPage} onOpenSeries={(key) => void openSeries(key)} onOpenItem={openItem}
+            onOpenMovie={(item) => openSubpage({ kind: 'movie', item })}
             onEdit={(target) => openSubpage({ kind: 'genre', target })} />
         )}
           </div>
+          {subpage?.kind === 'movie' ? <MovieDetail item={subpage.item} busy={busy === subpage.item.id}
+            onBack={() => { stopPlayback(); setSubpage(null); }} onPlay={() => void play(subpage.item)}
+            error={playError?.item.id === subpage.item.id ? playError.message : null} /> : null}
           {subpage?.kind === 'genre' ? <GenrePage target={subpage.target} onClose={() => setSubpage(null)} onSave={async (genres) => {
             await call(IPC.libraryGenresUpdate, { workKey: subpage.target.workKey, genres });
             if (detail) {
               setDetail((current) => current ? { ...current, summary: { ...current.summary, genres: genres ?? current.summary.genres } } : current);
               if (!genres) {
-                const result = await call<typeof detail>(IPC.librarySeries, { key: detail.summary.key }).catch(() => null);
-                if (result) setDetail((current) => current?.summary.key === result.summary.key ? result : current);
+                const result = await call<SeriesData | null>(IPC.librarySeries, { key: detail.summary.key }).catch(() => null);
+                if (result) setDetail((current) => current?.summary.key === result.summary.key ? { ...current, ...result } : current);
               }
             }
             setSubpage((current) => current === subpage ? null : current);
@@ -614,7 +712,7 @@ export default function App() {
           {subpage?.kind === 'browse' ? <BrowsePage key={subpage.source.id} source={subpage.source} onClose={() => setSubpage(null)}
             onScope={() => setSubpage({ kind: 'scan-scope', source: subpage.source })} /> : null}
           {subpage?.kind === 'scan-scope' ? <ScanScopePage key={subpage.source.id} source={subpage.source}
-            onBack={() => setSubpage(null)} onSave={async (scope, scanNow) => {
+            allowScan={!isBrowserPreview} onBack={() => setSubpage(null)} onSave={async (scope, scanNow) => {
               const updated = await call<StorageSource>(IPC.sourcesScanScope, { sourceId: subpage.source.id, scope });
               setSubpage((current) => current === subpage ? null : current);
               setNav('sources');
@@ -626,103 +724,158 @@ export default function App() {
             onClose={() => setSubpage(null)} onCreated={(source) => handleSourceCreated(subpage, source)} /> : null}
         </div>
 
-      {player && player.status !== 'idle' ? (
-        <section className="player" aria-label="播放控制">
-          <div className="player__info">
-            <span className="player__mark"><Icon name="movie" /></span>
-            <div><div className="player__title" title={player.title ?? undefined}>{player.title ?? '未知'}</div>
-              <div className="player__sub">{player.status === 'error' ? (player.error ?? '播放错误') : PLAYER_STATUS[player.status]}</div></div>
-          </div>
-          <div className="player__timeline">
-            <span className="player__time">{fmtTime(player.position)}</span>
-            <input
-              className="slider"
-              aria-label="播放进度"
-              type="range"
-              min={0}
-              max={Math.max(1, player.duration)}
-              value={Math.min(player.position, player.duration || 0)}
-              onChange={(e) => void playerCmd('seek', Number(e.target.value))}
-            />
-            <span className="player__time">{fmtTime(player.duration)}</span>
-          </div>
-          <div className="player__controls">
-            <button className="btn btn--icon" onClick={() => void playerCmd('seek-relative', -10)} title="后退 10s">
-              <Icon name="rewind" />
-            </button>
-            <button className="btn btn--icon btn--play" onClick={() => void playerCmd('toggle-pause')} title="播放/暂停">
-              <Icon name={player.status === 'paused' ? 'play' : 'pause'} />
-            </button>
-            <button className="btn btn--icon" onClick={() => void playerCmd('seek-relative', 10)} title="前进 10s">
-              <Icon name="skip" />
-            </button>
-            <button className="btn btn--icon" onClick={() => void playerCmd('mute')} title="静音">
-              <Icon name={player.muted ? 'mute' : 'volume'} />
-            </button>
-            <input
-              className="slider slider--vol"
-              aria-label="音量"
-              type="range"
-              min={0}
-              max={150}
-              value={player.volume}
-              onChange={(e) => void playerCmd('volume', Number(e.target.value))}
-            />
-            {player.tracks.some((t) => t.type === 'audio') ? (
-              <select
-                className="select select--sm"
-                value={player.activeAudioId ?? ''}
-                onChange={(e) => void playerCmd('audio', Number(e.target.value))}
-                title="音轨"
-              >
-                {player.tracks
-                  .filter((t) => t.type === 'audio')
-                  .map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.title}
-                    </option>
-                  ))}
-              </select>
-            ) : null}
-            {player.tracks.some((t) => t.type === 'sub') ? (
-              <select
-                className="select select--sm"
-                value={player.activeSubId ?? ''}
-                onChange={(e) => void playerCmd('subtitle', Number(e.target.value))}
-                title="字幕"
-              >
-                {player.tracks
-                  .filter((t) => t.type === 'sub')
-                  .map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.title}
-                    </option>
-                  ))}
-              </select>
-            ) : null}
-            <select
-              className="select select--sm"
-              value={player.speed}
-              onChange={(e) => void playerCmd('speed', Number(e.target.value))}
-              title="倍速"
-            >
-              {[0.5, 0.75, 1, 1.25, 1.5, 2].map((v) => (
-                <option key={v} value={v}>
-                  {v}x
-                </option>
-              ))}
-            </select>
-            <button className="btn btn--icon" onClick={() => void playerCmd('fullscreen')} title="全屏">
-              <Icon name="fullscreen" />
-            </button>
-            <button className="btn btn--icon" onClick={() => void call(IPC.playStop)} title="停止">
-              <Icon name="close" />
-            </button>
-          </div>
-        </section>
-      ) : null}
+        {!watching && player && player.status !== 'idle' ?
+          <PlayerControls player={player} playerCmd={playerCmd} onStop={stopPlayback} /> : null}
       </main>
     </div>
+  );
+}
+
+function PlayerControls({ player, playerCmd, onStop, media }: {
+  player: PlayerState;
+  playerCmd: (command: string, value?: number | string) => void;
+  onStop: () => void;
+  media?: { title: string; episode: string | null };
+}) {
+  return (
+    <section className="player" aria-label="播放控制">
+      <div className="player__info">
+        <span className="player__mark"><Icon name="movie" /></span>
+        <div><div className="player__title" title={player.title ?? undefined}>{player.title ?? '未知'}</div>
+          <div className="player__sub">{player.status === 'error' ? (player.error ?? '播放错误') : PLAYER_STATUS[player.status]}</div></div>
+        {media ? <div className="player__now-playing">
+          <span className="player__now-title" title={media.title}>{media.title}</span>
+          {media.episode ? <span className="player__now-episode">{media.episode}</span> : null}
+        </div> : null}
+      </div>
+      <div className="player__timeline">
+        <span className="player__time">{fmtTime(player.position)}</span>
+        <input
+          className="slider"
+          aria-label="播放进度"
+          type="range"
+          min={0}
+          max={Math.max(1, player.duration)}
+          value={Math.min(player.position, player.duration || 0)}
+          onChange={(e) => void playerCmd('seek', Number(e.target.value))}
+        />
+        <span className="player__time">{fmtTime(player.duration)}</span>
+      </div>
+      <div className="player__controls">
+        <button className="btn btn--icon" onClick={() => void playerCmd('seek-relative', -10)} title="后退 10 秒（←）" aria-keyshortcuts="ArrowLeft">
+          <Icon name="rewind" />
+        </button>
+        <button className="btn btn--icon btn--play" onClick={() => void playerCmd('toggle-pause')} title="播放/暂停（空格 / K）" aria-keyshortcuts="Space K">
+          <Icon name={player.status === 'paused' ? 'play' : 'pause'} />
+        </button>
+        <button className="btn btn--icon" onClick={() => void playerCmd('seek-relative', 10)} title="前进 10 秒（→）" aria-keyshortcuts="ArrowRight">
+          <Icon name="skip" />
+        </button>
+        <button className="btn btn--icon" onClick={() => void playerCmd('mute')} title="静音（M）" aria-keyshortcuts="M">
+          <Icon name={player.muted ? 'mute' : 'volume'} />
+        </button>
+        <input
+          className="slider slider--vol"
+          aria-label="音量"
+          title="音量（↑ / ↓ 或画面上滚动鼠标）"
+          aria-keyshortcuts="ArrowUp ArrowDown"
+          type="range"
+          min={0}
+          max={150}
+          value={player.volume}
+          onChange={(e) => void playerCmd('volume', Number(e.target.value))}
+        />
+        {player.tracks.some((t) => t.type === 'audio') ? (
+          <select
+            className="select select--sm"
+            value={player.activeAudioId ?? ''}
+            onChange={(e) => void playerCmd('audio', Number(e.target.value))}
+            title="音轨"
+          >
+            {player.tracks
+              .filter((t) => t.type === 'audio')
+              .map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.title}
+                </option>
+              ))}
+          </select>
+        ) : null}
+        {player.tracks.some((t) => t.type === 'sub') ? (
+          <select
+            className="select select--sm"
+            value={player.activeSubId ?? ''}
+            onChange={(e) => void playerCmd('subtitle', Number(e.target.value))}
+            title="字幕"
+          >
+            {player.tracks
+              .filter((t) => t.type === 'sub')
+              .map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.title}
+                </option>
+              ))}
+          </select>
+        ) : null}
+        <select
+          className="select select--sm"
+          value={player.speed}
+          onChange={(e) => void playerCmd('speed', Number(e.target.value))}
+          title="倍速"
+        >
+          {[0.5, 0.75, 1, 1.25, 1.5, 2].map((v) => (
+            <option key={v} value={v}>
+              {v}x
+            </option>
+          ))}
+        </select>
+        <button className="btn btn--icon" onClick={() => void playerCmd('fullscreen')}
+          aria-label={player.fullscreen ? '退出全屏' : '全屏'}
+          title={player.fullscreen ? '退出全屏（F / Esc）' : '全屏（F）'}
+          aria-keyshortcuts={player.fullscreen ? 'F Escape' : 'F'}>
+          <Icon name="fullscreen" />
+        </button>
+        <button className="btn btn--icon" onClick={onStop} aria-label="停止播放" title="停止播放">
+          <Icon name="close" />
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function WatchPage({ selection, player, opening, error, onBack, onPlay, onCommand }: {
+  selection: WatchSelection;
+  player: PlayerState | null;
+  opening: boolean;
+  error: string | null;
+  onBack: () => void;
+  onPlay: (item: MediaItem) => void;
+  onCommand: (command: string, value?: number | string) => void;
+}) {
+  const { item, series } = selection;
+  const title = series?.summary.title ?? item.seriesTitle ?? item.title;
+  const episode = item.episode !== null ? episodeDisplayLabel(item) : null;
+  const heading = useRef<HTMLHeadingElement>(null);
+  useLayoutEffect(() => { heading.current?.focus({ preventScroll: true }); }, []);
+  const playbackError = error ?? (!opening && player?.status === "error" ? player.error ?? "播放失败" : null);
+  return (
+    <section className="watch-page" aria-labelledby="watch-title">
+      <header className="watch-header">
+        <button className="btn btn--ghost watch-header__back" onClick={onBack}><Icon name="back" /> 返回影库</button>
+        <div className="watch-header__identity">
+          <h1 id="watch-title" ref={heading} tabIndex={-1}>{title}</h1>
+          {episode || item.year ? <span>{episode ?? item.year}</span> : null}
+        </div>
+      </header>
+      <div className={series ? "watch-layout watch-layout--series" : "watch-layout"}>
+        <div className="watch-screen">
+          <InlineVideo player={player} opening={opening} error={playbackError} onRetry={() => onPlay(item)} />
+          {player && !playbackError ? <PlayerControls player={player} playerCmd={onCommand} onStop={onBack}
+            media={player.fullscreen ? { title, episode } : undefined} /> : null}
+        </div>
+        {series ? <WatchEpisodes key={series.summary.key} series={series} activeItem={item} busy={opening ? item.id : null} onPlay={onPlay} /> : null}
+      </div>
+    </section>
   );
 }
 
@@ -737,14 +890,14 @@ function Empty({ title, text, icon, action }: { title: string; text: string; ico
   );
 }
 
-function LoadingCards() {
-  return <div className="catalog-grid skeleton-grid" role="status" aria-label="正在加载">
+function LoadingCards({ portrait = false }: { portrait?: boolean }) {
+  return <div className="catalog-grid skeleton-grid" data-portrait={portrait} role="status" aria-label="正在加载">
     {Array.from({ length: 6 }, (_, index) => <div key={index} className="skeleton-card" aria-hidden="true"><div /><span /><span /></div>)}
   </div>;
 }
 
 function LibraryView({ home, video, label, entries, total, loading, error, search, genre, page, busy, sourceCount, detailPending,
-  onRetry, onGenre, onClear, onPage, onOpenSeries, onPlay, onEdit, onAddSource, onSources }: {
+  onRetry, onGenre, onClear, onPage, onOpenSeries, onOpenMovie, onOpenItem, onEdit, onAddSource, onSources }: {
   home: boolean;
   video: boolean;
   label: string;
@@ -763,7 +916,8 @@ function LibraryView({ home, video, label, entries, total, loading, error, searc
   onClear: () => void;
   onPage: (page: number) => void;
   onOpenSeries: (key: string) => void;
-  onPlay: (id: string) => void;
+  onOpenMovie: (item: MediaItem) => void;
+  onOpenItem: (item: MediaItem) => void;
   onEdit: (target: GenreEditTarget) => void;
   onAddSource: () => void;
   onSources: () => void;
@@ -780,11 +934,14 @@ function LibraryView({ home, video, label, entries, total, loading, error, searc
 
   return (
     <section className="library-view">
-      {showHero ? <div className="library-hero">
+      {showHero ? <div className="library-hero" data-motion="parallax">
+        <div className="library-hero__art" aria-hidden="true" />
         <div className="library-hero__content">
-          <div className="library-hero__label"><Icon name="movie" /> 星云影库</div>
-          <h1>我的片库</h1>
-          <p>电影、电视剧和动漫，尽收于此。</p>
+          <h1>我的影库</h1>
+          <dl className="library-hero__stats">
+            <div><dt>部作品</dt><dd>{loading && !total ? '—' : total.toLocaleString('zh-CN')}</dd></div>
+            <div><dt>个存储源</dt><dd>{sourceCount.toLocaleString('zh-CN')}</dd></div>
+          </dl>
           <div className="library-hero__actions">
             {total > 0
               ? <button className="btn btn--primary" onClick={() => {
@@ -792,20 +949,16 @@ function LibraryView({ home, video, label, entries, total, loading, error, searc
                 results.current?.scrollIntoView({ block: 'start' });
               }}>浏览作品 <Icon name="down" /></button>
               : <button className="btn btn--primary" onClick={sourceCount ? onSources : onAddSource}>
-                <Icon name={sourceCount ? 'scan' : 'plus'} /> {sourceCount ? '管理存储源' : '添加存储源'}
+                <Icon name={sourceCount ? 'sources' : 'plus'} /> {sourceCount ? '管理存储源' : '添加存储源'}
               </button>}
           </div>
         </div>
-        <dl className="library-hero__stats">
-          <div><dt>部作品</dt><dd>{loading && !total ? '—' : total.toLocaleString('zh-CN')}</dd></div>
-          <div><dt>个存储源</dt><dd>{sourceCount.toLocaleString('zh-CN')}</dd></div>
-        </dl>
       </div> : null}
 
       {!home || !showHero ? <PageHeading
         title={search.trim() ? '搜索结果' : label}
         icon={search.trim() ? 'search' : NAV.find((entry) => entry.label === label)?.icon}
-        description={search.trim() ? `正在查找「${search.trim()}」` : undefined}
+        description={search.trim() ? `关键词「${search.trim()}」` : undefined}
       /> : null}
 
       <div className="catalog-results" ref={results} tabIndex={-1} aria-busy={loading}>
@@ -828,7 +981,7 @@ function LibraryView({ home, video, label, entries, total, loading, error, searc
         </div> : null}
 
         {error ? <div className="play-error" role="alert"><span>{error}</span><button className="btn btn--ghost btn--sm" onClick={onRetry}>重新加载</button></div>
-          : loading && !entries.length ? <LoadingCards />
+          : loading && !entries.length ? <LoadingCards portrait={video} />
           : !entries.length ? <Empty icon={filtered ? 'search' : 'movie'}
             title={filtered ? '没有匹配的作品' : '这里还没有媒体'}
             text={filtered ? '试试其他关键词或题材。' : '扫描存储源后，符合条件的媒体会自动出现在这里。'}
@@ -836,27 +989,35 @@ function LibraryView({ home, video, label, entries, total, loading, error, searc
               <button className="btn btn--ghost" onClick={sourceCount ? onSources : onAddSource}>
                 {sourceCount ? '管理存储源' : '添加存储源'} <Icon name="forward" />
               </button>} />
-          : <div className="catalog-grid" data-loading={loading}>
-            {entries.map((entry) => {
+          : <div className="catalog-grid" data-portrait={video} data-loading={loading}>
+            {entries.map((entry, index) => {
               const item = entry.kind === 'series' ? entry.series : entry.item;
               const isSeries = entry.kind === 'series';
               const name = isSeries ? entry.series.title : entry.item.seriesTitle ?? entry.item.title;
-              const pending = isSeries ? detailPending === entry.series.key : busy === entry.item.id;
-              const meta = isSeries ? [entry.series.year, ...entry.series.genres.slice(0, 2), `${entry.series.seasonCount} 季 · ${entry.series.episodeCount} 集`]
-                : [entry.item.year, ...(entry.item.genres?.slice(0, 2) ?? []), entry.item.resolution];
-              return <div className="catalog-card" key={isSeries ? entry.series.key : entry.item.id}>
-                <button className="card" title={name} disabled={pending}
-                onClick={() => isSeries ? onOpenSeries(entry.series.key) : onPlay(entry.item.id)}>
+              const seriesKey = isSeries ? entry.series.key : entry.item.seriesKey;
+              const pending = (entry.kind === "item" && busy === entry.item.id) || Boolean(seriesKey && detailPending === seriesKey);
+              const meta = isSeries ? [entry.series.year, `${entry.series.seasonCount} 季 · ${entry.series.episodeCount} 集`, ...entry.series.genres.slice(0, 1)]
+                : [entry.item.year, entry.item.resolution, ...(entry.item.genres?.slice(0, 1) ?? [])];
+              return <div className="catalog-card" key={isSeries ? entry.series.key : entry.item.id}
+                style={{ '--card-order': Math.min(9, index) } as CSSProperties}>
+                <button className="card" title={name} disabled={pending} data-motion="tilt"
+                data-return-key={entry.kind === "series" ? "series:" + entry.series.key : "item:" + entry.item.id}
+                onClick={() => isSeries ? onOpenSeries(entry.series.key) : onOpenItem(entry.item)}>
                 <div className="catalog-card__image">
                   <Poster item={item} />
+                  <span className="card__shine" aria-hidden="true" />
                   <span className="catalog-card__section">{SECTION_LABEL[item.section]}</span>
-                  <span className="catalog-card__action" aria-hidden="true"><Icon name={isSeries ? 'forward' : 'play'} /></span>
+                  {item.rating !== null ? <span className="catalog-card__rating" title="TMDB 评分">★ {item.rating.toFixed(1)}</span> : null}
+                  <span className="catalog-card__action" aria-hidden="true"><Icon name={seriesKey ? 'forward' : 'play'} /></span>
                 </div>
                 <div className="card__body">
                   <div className="card__title">{name}</div>
                   <div className="card__meta">{pending ? '正在打开…' : meta.filter(Boolean).join(' · ')}</div>
                 </div>
                 </button>
+                {entry.kind === 'item' && entry.item.section === 'movie' && (entry.item.overview || entry.item.rating !== null) ?
+                  <button className="catalog-card__edit catalog-card__details" data-return-key={"details:" + entry.item.id} title="影片详情" aria-label={'查看《' + name + '》的详情'}
+                    onClick={() => onOpenMovie(entry.item)}><Icon name="info" /></button> : null}
                 {video && entry.workKey ? <button className="catalog-card__edit" title="修改题材" aria-label={`修改《${name}》的题材`}
                   onClick={() => onEdit({ workKey: entry.workKey!, title: name, genres: item.genres ?? [] })}><Icon name="edit" /></button> : null}
               </div>;
@@ -911,6 +1072,45 @@ function episodeName(item: MediaItem): string {
     : `第 ${item.episode} 集`;
 }
 
+function episodeDisplayLabel(item: MediaItem): string {
+  const season = item.season === 0 ? "特别篇" : "第 " + (item.season ?? 1) + " 季";
+  return season + " · " + episodeName(item);
+}
+
+function MovieDetail({ item, busy, onBack, onPlay, error }: {
+  item: MediaItem;
+  busy: boolean;
+  onBack: () => void;
+  onPlay: () => void;
+  error: string | null;
+}) {
+  const title = useRef<HTMLHeadingElement>(null);
+  useEffect(() => { title.current?.focus({ preventScroll: true }); }, []);
+
+  return (
+    <section className="detail">
+      <button className="btn back-link" onClick={onBack}><Icon name="back" /> 返回影库</button>
+      <div className="detail__head">
+        {item.backdrop ? <img className="detail__backdrop" src={item.backdrop} alt="" /> : null}
+        <Poster item={item} big />
+        <div className="detail__identity">
+          <p className="detail__kind">电影</p>
+          <h1 className="detail__title" ref={title} tabIndex={-1}>{item.title}</h1>
+          <div className="detail__meta">
+            {[item.year, item.rating === null ? null : 'TMDB ' + item.rating.toFixed(1) + '/10', item.resolution].filter(Boolean).join(' · ')}
+          </div>
+          {item.overview ? <p className="detail__overview">{item.overview}</p> : null}
+          {item.genres?.length ? <div className="detail__genres">{item.genres.map((genre) => <span key={genre}>{genre}</span>)}</div> : null}
+          <button className="btn btn--primary" disabled={busy} onClick={onPlay}>
+            <Icon name="play" /> {busy ? '正在打开…' : '播放'}
+          </button>
+          {error ? <p className="error" role="alert">{error}</p> : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function SeriesDetail({
   data,
   onBack,
@@ -918,25 +1118,19 @@ function SeriesDetail({
   onEdit,
   busy,
 }: {
-  data: { summary: SeriesSummary; items: MediaItem[] };
+  data: SeriesPageData;
   onBack: () => void;
-  onPlay: (id: string) => void;
+  onPlay: (item: MediaItem) => void;
   onEdit: () => void;
   busy: string | null;
 }) {
-  const seasons = useMemo(() => {
-    const map = new Map<number, MediaItem[]>();
-    for (const it of data.items) {
-      const s = it.season ?? 1;
-      const arr = map.get(s) ?? [];
-      arr.push(it);
-      map.set(s, arr);
-    }
-    return [...map.entries()].sort((a, b) => a[0] - b[0]);
-  }, [data.items]);
-  const [selectedSeason, setSelectedSeason] = useState(seasons.find(([season]) => season > 0)?.[0] ?? seasons[0]?.[0] ?? 1);
+  const seasons = useMemo(() => groupSeasons(data.items), [data.items]);
+  const { resume } = data;
+  const resumeSeason = resume ? resume.item.season ?? 1 : undefined;
+  const [selectedSeason, setSelectedSeason] = useState(resumeSeason ?? seasons.find(([season]) => season > 0)?.[0] ?? seasons[0]?.[0] ?? 1);
   const episodes = seasons.find(([season]) => season === selectedSeason)?.[1] ?? [];
-  const first = episodes[0];
+  const nextItem = resume?.item ?? episodes[0];
+  const backdrop = data.items.find((item) => item.backdrop)?.backdrop;
   const title = useRef<HTMLHeadingElement>(null);
   useEffect(() => { title.current?.focus({ preventScroll: true }); }, []);
 
@@ -946,6 +1140,7 @@ function SeriesDetail({
         <Icon name="back" /> 返回影库
       </button>
       <div className="detail__head">
+        {backdrop ? <img className="detail__backdrop" src={backdrop} alt="" /> : null}
         <Poster item={data.summary} big />
         <div className="detail__identity">
           <p className="detail__kind">{SECTION_LABEL[data.summary.section]}</p>
@@ -953,31 +1148,81 @@ function SeriesDetail({
           <div className="detail__meta">
             {data.summary.year ? `${data.summary.year} · ` : ''}
             {data.summary.episodeCount} 集 · {data.summary.seasonCount} 季
+            {data.summary.rating !== null ? ' · TMDB ' + data.summary.rating.toFixed(1) + '/10' : ''}
           </div>
+          {data.summary.overview ? <p className="detail__overview">{data.summary.overview}</p> : null}
           {data.summary.genres.length ? <div className="detail__genres">{data.summary.genres.map((genre) => <span key={genre}>{genre}</span>)}</div> : null}
-          <div className="detail__actions">{first ? <button className="btn btn--primary" disabled={busy === first.id} onClick={() => onPlay(first.id)}>
-            <Icon name="play" /> {busy === first.id ? '正在打开…' : `播放${episodeName(first)}`}
-          </button> : null}<button className="btn btn--ghost" onClick={onEdit}><Icon name="edit" /> 修改题材</button></div>
+          <div className="detail__actions">
+            {nextItem ? <button className="btn btn--primary" disabled={busy === nextItem.id} onClick={() => onPlay(nextItem)}>
+              <Icon name="play" /> {busy === nextItem.id ? "正在打开…" : resume
+                ? `续播 ${episodeDisplayLabel(nextItem)}`
+                : `播放${episodeName(nextItem)}`}
+            </button> : null}
+            <button className="btn btn--ghost" onClick={onEdit}><Icon name="edit" /> 修改题材</button>
+            {resume ? <span className="detail__progress">看到 {fmtTime(resume.position)}</span> : null}
+          </div>
         </div>
       </div>
-      <div className="season">
-        <h2 className="season__title">选集</h2>
-        <div className="season-tabs" aria-label="选择季度">
-          {seasons.map(([season, list]) => <button key={season} className="filter-chip" aria-pressed={season === selectedSeason}
-            onClick={() => setSelectedSeason(season)}>{season === 0 ? '特别篇' : `第 ${season} 季`} <span>{list.length} 集</span></button>)}
-        </div>
-        <div className="episodes">
-            {episodes.map((it) => (
-              <button key={it.id} className="episode" onClick={() => onPlay(it.id)} disabled={busy === it.id}>
-                <span className="episode__play"><Icon name="play" /></span>
-                <span className="episode__name">{episodeName(it)}</span>
-                <span className="episode__tag">{busy === it.id ? '正在打开…' : [it.resolution, it.quality].filter(Boolean).join(' · ')}</span>
-              </button>
-            ))}
-        </div>
-      </div>
+      <EpisodePicker seasons={seasons} selectedSeason={selectedSeason} onSelectSeason={setSelectedSeason} busy={busy} onPlay={onPlay} />
     </section>
   );
+}
+
+function groupSeasons(items: MediaItem[]): Array<[number, MediaItem[]]> {
+  const groups = new Map<number, MediaItem[]>();
+  for (const item of items) {
+    const season = item.season ?? 1;
+    const episodes = groups.get(season) ?? [];
+    episodes.push(item);
+    groups.set(season, episodes);
+  }
+  return [...groups.entries()].sort(([a], [b]) => a - b);
+}
+
+function WatchEpisodes({ series, activeItem, busy, onPlay }: {
+  series: SeriesData;
+  activeItem: MediaItem;
+  busy: string | null;
+  onPlay: (item: MediaItem) => void;
+}) {
+  const seasons = useMemo(() => groupSeasons(series.items), [series.items]);
+  const [selectedSeason, setSelectedSeason] = useState(activeItem.season ?? 1);
+  const episodes = useRef<HTMLDivElement>(null);
+  const selectSeason = (season: number) => {
+    setSelectedSeason(season);
+    episodes.current?.scrollTo({ top: 0, behavior: 'instant' });
+  };
+  return <aside className="watch-episodes" aria-label="剧集列表">
+    <EpisodePicker seasons={seasons} selectedSeason={selectedSeason} onSelectSeason={selectSeason}
+      activeId={activeItem.id} busy={busy} onPlay={onPlay} episodesRef={episodes} />
+  </aside>;
+}
+
+function EpisodePicker({ seasons, selectedSeason, onSelectSeason, activeId, busy, onPlay, episodesRef }: {
+  seasons: Array<[number, MediaItem[]]>;
+  selectedSeason: number;
+  onSelectSeason: (season: number) => void;
+  activeId?: string;
+  busy: string | null;
+  onPlay: (item: MediaItem) => void;
+  episodesRef?: React.Ref<HTMLDivElement>;
+}) {
+  const episodes = seasons.find(([season]) => season === selectedSeason)?.[1] ?? [];
+  return <section className="season">
+    <h2 className="season__title">选集</h2>
+    <div className="season-tabs" role="group" aria-label="选择季度">
+      {seasons.map(([season, list]) => <button key={season} className="filter-chip" aria-pressed={season === selectedSeason}
+        onClick={() => onSelectSeason(season)}>{season === 0 ? "特别篇" : "第 " + season + " 季"} <span>{list.length} 集</span></button>)}
+    </div>
+    <div className="episodes" ref={episodesRef} key={selectedSeason}>
+      {episodes.map((item) => <button key={item.id} className="episode" onClick={() => onPlay(item)}
+        disabled={busy === item.id} aria-current={activeId === item.id ? "true" : undefined}>
+        <span className="episode__play"><Icon name="play" /></span>
+        <span className="episode__name">{episodeName(item)}</span>
+        <span className="episode__tag">{busy === item.id ? "正在打开…" : [item.resolution, item.quality].filter(Boolean).join(" · ")}</span>
+      </button>)}
+    </div>
+  </section>;
 }
 
 function SourcesPanel({ sources, onAdd, onRemove, onTest, onScan, onBrowse, onScope, scanning }: {
@@ -1065,11 +1310,13 @@ function SourceCard({ source, scanning, onRemove, onTest, onScan, onBrowse, onSc
         <button className={'btn btn--sm ' + (pendingScope ? 'btn--primary' : 'btn--ghost')} disabled={scanning || pending === 'remove'} onClick={onScope}>
           <Icon name="edit" /> 扫描范围
         </button>
-        <button className="btn btn--primary btn--sm" disabled={!source.enabled || pendingScope || scanning || pending === 'remove'} onClick={onScan}>
-          <Icon name="scan" /> {scanning ? '扫描中…' : '扫描'}
-        </button>
-        <button ref={removeButton} className="btn btn--quiet-danger btn--sm" aria-expanded={confirmRemoval}
-          disabled={Boolean(pending) || scanning} onClick={() => setConfirmRemoval((show) => !show)}>移除</button>
+        {!isBrowserPreview ? <>
+          <button className="btn btn--primary btn--sm" disabled={!source.enabled || pendingScope || scanning || pending === 'remove'} onClick={onScan}>
+            <Icon name="scan" /> {scanning ? '扫描中…' : '扫描'}
+          </button>
+          <button ref={removeButton} className="btn btn--quiet-danger btn--sm" aria-expanded={confirmRemoval}
+            disabled={Boolean(pending) || scanning} onClick={() => setConfirmRemoval((show) => !show)}>移除</button>
+        </> : null}
       </div>
     </div>
     {confirmRemoval ? <div ref={confirmation} tabIndex={-1} className="source-card__confirm">
@@ -1236,10 +1483,11 @@ function SettingsPanel({
 
   return (
     <section className="panel">
-      <PageHeading title="设置" icon="settings" description="配置播放方式、网盘连接和应用更新。" />
+      <PageHeading title="设置" icon="settings" description="配置播放方式、网盘连接、影视元数据和应用更新。" />
       <nav className="settings-nav" aria-label="设置分类">
         <a href="#playback-settings"><Icon name="play" /> 播放设置</a>
         <a href="#cloud-settings"><Icon name="cloud" /> 网盘连接</a>
+        {!isBrowserPreview ? <a href="#tmdb-settings"><Icon name="movie" /> 影视元数据</a> : null}
         <a href="#update-settings"><Icon name="scan" /> 关于与更新</a>
       </nav>
 
@@ -1397,6 +1645,8 @@ function SettingsPanel({
         <CloudDrivePicker sources={sources} onChoose={onOpenAddSource} />
       </section>
 
+      {!isBrowserPreview ? <TmdbSettings /> : null}
+
       <section className="surface settings-section" id="update-settings">
       <div className="section-heading">
         <h2>关于与更新</h2>
@@ -1418,6 +1668,7 @@ function SettingsPanel({
           </button>
         ) : null}
       </div>
+      {!isBrowserPreview ? <TmdbAttribution /> : null}
       {update ? (
         <div className="update-result" role="status">
           {update.error ? (

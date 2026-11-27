@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, nativeImage, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu, nativeImage, net, shell } from 'electron';
 import { join, dirname } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
@@ -12,19 +12,25 @@ import type {
   BrowseQuery,
   Genre,
   MediaItem,
+  PlayerState,
   ScanProgress,
   ScanScope,
   ScanSummary,
   SourceConfig,
   SourceKind,
   StorageSource,
+  VideoSurfaceBounds,
 } from '../shared/types';
 import { createRepository, type Repository } from './db';
 import { sourceId as newSourceId } from './db/ids';
 import { checkForUpdate, UPDATE_REPO } from './updater';
 import { createProvider } from './sources/registry';
-import { getDriveInfo, listBizExtKeys, pollQrLogin, refreshToken, startQrLogin, type AliyunToken, type DriveInfo, type QrSession } from './sources/aliyun-auth';
-import { encryptSecret } from './sources/secrets';
+import { getDriveInfo, refreshToken, type AliyunToken, type DriveInfo } from './sources/aliyun-auth';
+import { decryptSecret, encryptSecret } from './sources/secrets';
+import { createTmdbClient, normalizeTmdbCredential, TMDB_CREDENTIAL_KEY } from './metadata/tmdb';
+import { TmdbSync } from './metadata/sync';
+import type { TmdbStatus } from '../shared/tmdb';
+import { createAliyunQrLogin } from './sources/aliyun-qr';
 import { parentOf, type StorageProvider } from './sources/types';
 import { scanSource } from './scan/scanner';
 import { listSourceDirectory, validateScanScope } from './scan/scope';
@@ -32,20 +38,35 @@ import { AUDIO_EXTS, IMAGE_EXTS, SUBTITLE_EXTS, VIDEO_EXTS } from './scan/namer'
 import { locateMpv } from './player/locate';
 import { detectExternalPlayers, migrateLegacyCommand, resolveExternalLaunch, splitArgs } from './player/external';
 import { MpvController } from './player/mpv';
+import type { PlaybackShortcut } from '../shared/playback-shortcuts';
+import type { WindowsVideoSurface } from './player/windows-video-surface';
 import { captureFirstVisibleFrame } from './player/cover';
 
 let win: BrowserWindow | null = null;
 let startupError: string | undefined;
 let repo: Repository;
 let settings: AppSettings;
+let tmdbSync: TmdbSync;
+let tmdbCredential = '';
+let checkingTmdbCredential = false;
 let controller: MpvController | null = null;
+let videoSurface: WindowsVideoSurface | null = null;
+let videoBounds: VideoSurfaceBounds | null = null;
+let playRequest = 0;
+let playbackWork = Promise.resolve();
+
+function runPlaybackWork<T>(operation: () => Promise<T>): Promise<T> {
+  const result = playbackWork.then(operation);
+  playbackWork = result.then(() => undefined, () => undefined);
+  return result;
+}
 let mpvPath: string | null = null;
 const scanning = new Map<string, AbortController>();
-const qrSessions = new Map<string, QrSession>();
 const aliyunProviders = new Map<string, StorageProvider>();
 const artworkCache = new Map<string, { expires: number; result: Promise<string | null> }>();
 const POSTER_MIME: Record<string, string> = { jpeg: 'image/jpeg', jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', bmp: 'image/bmp' };
 const POSTER_MAX_BYTES = 5_000_000;
+const electronFetch: typeof fetch = (input, init) => net.fetch(input instanceof URL ? input.href : input, init);
 
 const DEFAULT_SETTINGS: AppSettings = {
   mpvPath: null,
@@ -251,6 +272,7 @@ async function runScan(sourceId: string): Promise<ScanSummary> {
       });
     }
     broadcast(IPC.evLibrary, { reason: 'scan-done', sourceId, summary });
+    if (current && !summary.error && !ac.signal.aborted) tmdbSync.enqueue(sourceId);
     return summary;
   } finally {
     scanning.delete(sourceId);
@@ -301,43 +323,122 @@ async function findSubtitles(
 
 let saveTimer: NodeJS.Timeout | null = null;
 
+function savePlaybackProgress(): void {
+  const state = controller?.getState();
+  if (!state?.itemId || state.duration <= 0) return;
+  const item = repo.getItem(state.itemId);
+  if (!item) return;
+  repo.savePlayback({
+    itemId: state.itemId,
+    seriesKey: item.seriesKey,
+    position: state.position,
+    finished: state.status === 'ended' || state.position / state.duration > 0.95,
+    duration: state.duration,
+    updatedAt: Date.now(),
+  });
+}
+
 function scheduleSaveProgress(): void {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    const st = controller?.getState();
-    if (!st || !st.itemId || st.duration <= 0) return;
-    const item = repo.getItem(st.itemId);
-    if (!item) return;
-    const finished = st.status === 'ended' || (st.duration > 0 && st.position / st.duration > 0.95);
-    repo.savePlayback({
-      itemId: st.itemId,
-      seriesKey: item.seriesKey,
-      position: st.position,
-      duration: st.duration,
-      finished,
-      updatedAt: Date.now(),
-    });
+    savePlaybackProgress();
   }, 4000);
+}
+
+function syncVideoSurface(state = controller?.getState()): void {
+  if (videoBounds && state?.itemId && (state.status === 'playing' || state.status === 'paused')) {
+    videoSurface?.show(videoBounds);
+  } else {
+    videoSurface?.hide();
+  }
+}
+
+async function runPlayerCommand(payload: { command: string; value?: number | string }): Promise<{ handled: boolean }> {
+  if (!controller) return { handled: false };
+  switch (payload.command) {
+    case 'toggle-pause':
+      await controller.togglePause();
+      break;
+    case 'seek':
+      await controller.seek(Number(payload.value ?? 0));
+      break;
+    case 'seek-relative':
+      await controller.seek(Number(payload.value ?? 0), 'relative');
+      break;
+    case 'volume':
+      await controller.setVolume(Number(payload.value ?? 100));
+      break;
+    case 'volume-relative': {
+      const delta = Number(payload.value);
+      if (Number.isFinite(delta)) await controller.adjustVolume(delta);
+      break;
+    }
+    case 'mute':
+      await controller.toggleMute();
+      break;
+    case 'speed':
+      await controller.setSpeed(Number(payload.value ?? 1));
+      break;
+    case 'audio':
+      await controller.setAudio(Number(payload.value ?? 0));
+      break;
+    case 'subtitle':
+      await controller.setSubtitle(Number(payload.value ?? 0));
+      break;
+    case 'fullscreen':
+    case 'exit-fullscreen': {
+      const exit = payload.command === 'exit-fullscreen';
+      if (videoSurface && win && controller.getState().itemId) {
+        win.setFullScreen(!exit && !win.isFullScreen());
+      } else if (!videoSurface && (!exit || controller.getState().fullscreen)) {
+        await controller.toggleFullscreen();
+      }
+      break;
+    }
+    default:
+      return { handled: false };
+  }
+  return { handled: true };
 }
 
 async function ensureController(): Promise<MpvController> {
   if (controller) return controller;
   if (!mpvPath) throw new Error('未找到 mpv，无法内嵌播放。请在设置中指定 mpv.exe 路径，或改用外部播放器。');
+  if (process.platform === 'win32' && !videoSurface) {
+    const { WindowsVideoSurface } = await import('./player/windows-video-surface');
+    if (!win || win.isDestroyed()) throw new Error('播放窗口已关闭');
+    if (controller) return controller;
+    const surfaceWindow = win;
+    videoSurface ??= new WindowsVideoSurface(surfaceWindow.getNativeWindowHandle(), (code) => {
+      if (win !== surfaceWindow || !videoBounds || surfaceWindow.isDestroyed()) return;
+      if (code === 'click') surfaceWindow.webContents.focus();
+      controller?.handleEmbeddedInput(code);
+    });
+  }
   const c = new MpvController({
     mpvPath,
     hardwareDecode: settings.hardwareDecode,
-    wid: null,
+    wid: videoSurface?.wid,
     extraArgs: splitArgs(settings.player?.builtinArgs ?? ''),
   });
-  c.on('state', (state: unknown) => {
+  c.on('state', (state: PlayerState) => {
+    if (controller !== c) return;
+    syncVideoSurface(state);
     broadcast(IPC.evPlayer, state);
     scheduleSaveProgress();
   });
   c.on('finished', () => scheduleSaveProgress());
+  c.on('shortcut', (shortcut: Pick<PlaybackShortcut, 'command' | 'value'>) => {
+    if (controller !== c || !videoBounds) return;
+    void runPlayerCommand(shortcut);
+  });
   controller = c;
   return c;
 }
+
+type PlayResult = { mode: 'mpv' | 'external' | 'cancelled'; message: string };
+const CANCELLED_PLAY: PlayResult = { mode: 'cancelled', message: '' };
 
 async function playWithBuiltin(
   provider: StorageProvider,
@@ -345,18 +446,24 @@ async function playWithBuiltin(
   sourceKind: SourceKind,
   resolved: { url: string; headers: Record<string, string> },
   startAt: number,
-): Promise<string> {
-  const c = await ensureController();
+  request: number,
+): Promise<PlayResult> {
   const subtitles = await findSubtitles(provider, item, sourceKind);
-  await c.play({
-    itemId: item.id,
-    url: resolved.url,
-    headers: resolved.headers,
-    title: item.seriesTitle ? `${item.seriesTitle} ${fmtEpisode(item)}`.trim() : item.title,
-    startAt,
-    subtitles,
+  return runPlaybackWork(async () => {
+    if (request !== playRequest) return CANCELLED_PLAY;
+    const current = await ensureController();
+    if (request !== playRequest) return CANCELLED_PLAY;
+    savePlaybackProgress();
+    await current.play({
+      itemId: item.id,
+      url: resolved.url,
+      headers: resolved.headers,
+      title: item.seriesTitle ? [item.seriesTitle, fmtEpisode(item)].filter(Boolean).join(' ') : item.title,
+      startAt,
+      subtitles,
+    });
+    return request === playRequest ? { mode: 'mpv', message: '使用内置 mpv 播放' } : CANCELLED_PLAY;
   });
-  return '使用内置 mpv 播放';
 }
 
 /** 交给外部播放器；配置为「系统默认程序」时 cmd 为 null */
@@ -380,11 +487,13 @@ async function playWithExternal(
   return `已交给外部播放器：${plan.launch.cmd}`;
 }
 
-async function handlePlay(itemId: string): Promise<{ mode: 'mpv' | 'external'; message: string }> {
+async function handlePlay(itemId: string): Promise<PlayResult> {
+  const request = ++playRequest;
   const item = requireItem(itemId);
   const source = requireSource(item.sourceId);
   const provider = providerFor(source);
   const resolved = await provider.resolvePlayUrl(item.path);
+  if (request !== playRequest) return CANCELLED_PLAY;
   const record = repo.getPlayback(item.id);
   const startAt = record && !record.finished && record.position > 5 ? record.position : 0;
 
@@ -404,7 +513,7 @@ async function handlePlay(itemId: string): Promise<{ mode: 'mpv' | 'external'; m
         '播放方式设为「仅内置 mpv」，但没找到 mpv。请在设置里指定 mpv.exe 路径，或把播放方式改成「外部播放器」/「自动」。',
       );
     }
-    return { mode: 'mpv', message: await playWithBuiltin(provider, item, source.kind, resolved, startAt) };
+    return playWithBuiltin(provider, item, source.kind, resolved, startAt, request);
   }
 
   if (engine === 'external') {
@@ -413,7 +522,7 @@ async function handlePlay(itemId: string): Promise<{ mode: 'mpv' | 'external'; m
 
   // auto：内置优先，不可用再回落外部
   if (mpvPath) {
-    return { mode: 'mpv', message: await playWithBuiltin(provider, item, source.kind, resolved, startAt) };
+    return playWithBuiltin(provider, item, source.kind, resolved, startAt, request);
   }
   return { mode: 'external', message: `未找到 mpv，${await playWithExternal(item, resolved, startAt)}` };
 }
@@ -434,11 +543,11 @@ function createWindow(): void {
     height: 900,
     minWidth: 720,
     minHeight: 560,
-    backgroundColor: '#121319',
+    backgroundColor: '#090c14',
     show: false,
     autoHideMenuBar: true,
     titleBarStyle: 'hidden',
-    titleBarOverlay: { color: '#121319', symbolColor: '#b4b6c2', height: 36 },
+    titleBarOverlay: { color: '#090c14', symbolColor: '#bbcbe3', height: 36 },
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -452,9 +561,24 @@ function createWindow(): void {
     win?.show();
     log('[window] ready-to-show');
   });
+  win.on('enter-full-screen', () => controller?.setEmbeddedFullscreen(true));
+  win.on('leave-full-screen', () => controller?.setEmbeddedFullscreen(false));
+  win.webContents.on('did-start-navigation', (details) => {
+    if (!details.isMainFrame || details.isSameDocument) return;
+    videoBounds = null;
+    videoSurface?.hide();
+  });
+  win.webContents.on('render-process-gone', () => {
+    videoBounds = null;
+    videoSurface?.hide();
+  });
   win.on('closed', () => {
     log('[window] closed');
     win = null;
+    videoBounds = null;
+    videoSurface = null;
+    controller?.dispose();
+    controller = null;
   });
 
   // 渲染层错误默认只留在 DevTools 里，打包后等于不可见；接到主进程日志才能诊断白屏
@@ -583,17 +707,44 @@ function registerIpc(): void {
   handle(IPC.settingsGet, () => settings);
 
   handle(IPC.settingsUpdate, async (patch: Partial<AppSettings>) => {
+    if (Object.hasOwn(patch, TMDB_CREDENTIAL_KEY)) throw new Error('请在 TMDB 设置中更新凭据。');
     settings = { ...settings, ...patch };
     for (const [k, v] of Object.entries(patch)) repo.setSetting(k, v);
     if (patch.mpvPath !== undefined || patch.hardwareDecode !== undefined || patch.player !== undefined) {
       const located = await locateMpv(settings.mpvPath);
       mpvPath = located.path;
       // mpv 路径、硬解或内置参数变化后旧进程参数已失效，销毁让下次播放按新配置重建
-      controller?.dispose();
+      if (videoSurface && win?.isFullScreen()) win.setFullScreen(false);
+      videoSurface?.hide();
+      await controller?.stop();
       controller = null;
     }
     return settings;
   });
+
+  const tmdbStatus = (): TmdbStatus => ({ configured: Boolean(tmdbCredential), sync: tmdbSync.status });
+  handle(IPC.tmdbStatus, tmdbStatus);
+  handle(IPC.tmdbConfigure, async (payload: { credential: string | null }) => {
+    if (checkingTmdbCredential) throw new Error('正在验证 TMDB 凭据，请稍候。');
+    if (payload.credential !== null && typeof payload.credential !== 'string') throw new Error('请填写 TMDB 凭据。');
+    const credential = payload.credential === null ? '' : normalizeTmdbCredential(payload.credential);
+    checkingTmdbCredential = true;
+    try {
+      if (credential) await createTmdbClient(credential, electronFetch).test();
+      repo.setSetting(TMDB_CREDENTIAL_KEY, encryptSecret(credential));
+      if (credential !== tmdbCredential) tmdbSync.cancel();
+      tmdbCredential = credential;
+      return tmdbStatus();
+    } finally {
+      checkingTmdbCredential = false;
+    }
+  });
+  handle(IPC.tmdbSyncStart, () => {
+    if (!tmdbCredential) throw new Error('请先保存 TMDB 凭据。');
+    tmdbSync.enqueue();
+    return tmdbStatus();
+  });
+  handle(IPC.tmdbSyncCancel, () => tmdbSync.cancel());
 
   handle(IPC.mpvLocate, async () => {
     const located = await locateMpv(settings.mpvPath);
@@ -627,91 +778,14 @@ function registerIpc(): void {
     };
   });
 
-  handle(IPC.aliyunQrStart, async () => {
-    // 顺手清理过期会话，避免长期驻留
-    for (const [id, s] of qrSessions) {
-      if (Date.now() - s.createdAt > 3 * 60_000) qrSessions.delete(id);
-    }
-    const session = await startQrLogin();
-    qrSessions.set(session.id, session);
-    log('[aliyun] 已生成扫码会话');
-    return { sessionId: session.id, qrDataUrl: session.qrDataUrl, expiresInSec: 180 };
-  });
-
+  const aliyunQr = createAliyunQrLogin(repo);
+  handle(IPC.aliyunQrStart, () => aliyunQr.start());
   handle(IPC.aliyunQrPoll, async (payload: { sessionId: string; name?: string; driveId?: string }) => {
-    const session = qrSessions.get(payload.sessionId);
-    if (!session) {
-      log('[aliyun] 轮询时 session 已不存在:', payload.sessionId);
-      throw new Error('二维码会话已失效，请重新生成');
+    const result = await aliyunQr.poll(payload);
+    if (result.status === 'CONFIRMED') {
+      broadcast(IPC.evLibrary, { reason: 'source-added', sourceId: result.source.id });
     }
-    // 轮询本身抛错（网络 / 风控页 / 非 JSON 响应）以前只冒到 UI，日志里看不到。
-    // 这里记一笔再抛，否则用户只看到报错、我却无从定位。
-    const res = await pollQrLogin(session).catch((pollErr: unknown) => {
-      log('[aliyun] 轮询请求失败:', pollErr instanceof Error ? pollErr.message : String(pollErr));
-      throw pollErr;
-    });
-    if (res.status !== 'CONFIRMED') return { status: res.status };
-    if (!res.token) {
-      throw new Error('已扫码确认，但未能从响应中解析出 token（接口结构可能已变化）');
-    }
-
-    // 诊断：只记字段名不记值。真实扫码后拿到的 bizExt 结构可能与预期不同。
-    const bizExtRaw = (res.raw as { bizExt?: unknown } | undefined)?.bizExt;
-    const rawKeys =
-      res.raw && typeof res.raw === 'object' ? Object.keys(res.raw as Record<string, unknown>) : [];
-    log('[aliyun] CONFIRMED raw 顶层键:', rawKeys.join(',') || '(空)', '| bizExt 类型:', typeof bizExtRaw);
-    log('[aliyun] bizExt 字段名:', listBizExtKeys(bizExtRaw).join(',') || '(空/无法解析)');
-
-    if (!res.token) {
-      log('[aliyun] 已确认但未解析出 token，bizExt 字段名见上一行');
-      throw new Error('已扫码确认，但未能从响应中解析出 token（接口结构可能已变化）');
-    }
-
-    // bizExt 里的 accessToken 很可能只是 passport 会话 token，直接拿来调 openapi 会得到
-    // TokenVerifyFailed: invalid access_token（实测）。正确做法是先用 refresh_token
-    // 走标准 OAuth 换一次 PDS 的 access_token，再调 getDriveInfo。
-    // 分两步、分别记录：此前把 refresh 与 getDriveInfo 放在同一个 try 里，
-    // 实际失败在后者，日志却写成「refresh 换取失败」，把排查方向带偏了。
-    let token: AliyunToken = res.token;
-    try {
-      token = await refreshToken(res.token.refreshToken);
-      log('[aliyun] refresh_token 换取成功，expiresAt =', token.expiresAt);
-    } catch (refreshErr) {
-      log('[aliyun] refresh 换取失败，改用 bizExt accessToken：', refreshErr instanceof Error ? refreshErr.message : String(refreshErr));
-      token = res.token;
-    }
-
-    const drive = await getDriveInfo(token.accessToken).catch((driveErr: unknown) => {
-      log('[aliyun] getDriveInfo 失败：', driveErr instanceof Error ? driveErr.message : String(driveErr));
-      throw driveErr;
-    });
-    log('[aliyun] 挂载成功，drive_id =', drive.driveId, '网盘：', drive.driveName);
-
-    const config: AliyunSourceConfig = {
-      kind: 'aliyun',
-      driveId: (payload.driveId ?? '').trim() || drive.driveId,
-      refreshToken: encryptSecret(token.refreshToken),
-      accessToken: encryptSecret(token.accessToken),
-      expiresAt: token.expiresAt,
-      userName: token.userName ?? drive.driveName,
-      root: 'root',
-    };
-    const source: StorageSource = {
-      id: newSourceId(),
-      kind: 'aliyun',
-      name: (payload.name ?? '').trim() || drive.driveName || '阿里云盘',
-      config: { ...config, scanScope: { mode: 'pending' } },
-      enabled: true,
-      lastScanAt: null,
-      lastScanCount: 0,
-      lastError: null,
-      createdAt: Date.now(),
-    };
-    repo.insertSource(source);
-    qrSessions.delete(payload.sessionId);
-    log('[aliyun] 扫码授权成功，已挂载', source.name, drive.driveId);
-    broadcast(IPC.evLibrary, { reason: 'source-added', sourceId: source.id });
-    return { status: 'CONFIRMED' as const, source, driveName: drive.driveName };
+    return result;
   });
 
   handle(IPC.updateCheck, async () => checkForUpdate(app.getVersion()));
@@ -794,7 +868,9 @@ function registerIpc(): void {
     const scope = await validateScanScope(source, providerFor(source), payload.scope);
     if (scanning.has(payload.sourceId)) throw new Error('请先结束该源正在进行的扫描');
     const current = requireSource(payload.sourceId);
-    if (current.config.kind !== source.config.kind || current.config.scanScope !== source.config.scanScope &&
+    const location = (config: SourceConfig) => config.kind === 'local' ? config.roots : config.root;
+    if (current.config.kind !== source.config.kind ||
+        JSON.stringify(location(current.config)) !== JSON.stringify(location(source.config)) ||
         JSON.stringify(current.config.scanScope) !== JSON.stringify(source.config.scanScope)) {
       throw new Error('扫描范围已更改，请重新打开设置');
     }
@@ -833,49 +909,28 @@ function registerIpc(): void {
     return { saved: true };
   });
 
+  ipcMain.handle(IPC.playSurface, (event, bounds: VideoSurfaceBounds | null) => {
+    if (!win || event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame) return;
+    if (bounds !== null && (!bounds || typeof bounds !== 'object' ||
+        ![bounds.x, bounds.y, bounds.width, bounds.height, bounds.scale].every(Number.isFinite) ||
+        bounds.width <= 0 || bounds.height <= 0 || bounds.scale <= 0)) return;
+    videoBounds = bounds;
+    syncVideoSurface();
+  });
+
   handle(IPC.playItem, (payload: { itemId: string }) => handlePlay(payload.itemId));
 
-  handle(
-    IPC.playCommand,
-    async (payload: { command: string; value?: number | string }) => {
-      if (!controller) return { handled: false };
-      switch (payload.command) {
-        case 'toggle-pause':
-          await controller.togglePause();
-          break;
-        case 'seek':
-          await controller.seek(Number(payload.value ?? 0));
-          break;
-        case 'seek-relative':
-          await controller.seek(Number(payload.value ?? 0), 'relative');
-          break;
-        case 'volume':
-          await controller.setVolume(Number(payload.value ?? 100));
-          break;
-        case 'mute':
-          await controller.toggleMute();
-          break;
-        case 'speed':
-          await controller.setSpeed(Number(payload.value ?? 1));
-          break;
-        case 'audio':
-          await controller.setAudio(Number(payload.value ?? 0));
-          break;
-        case 'subtitle':
-          await controller.setSubtitle(Number(payload.value ?? 0));
-          break;
-        case 'fullscreen':
-          await controller.toggleFullscreen();
-          break;
-        default:
-          return { handled: false };
-      }
-      return { handled: true };
-    },
-  );
+  handle(IPC.playCommand, runPlayerCommand);
 
   handle(IPC.playStop, async () => {
-    await controller?.stop();
+    ++playRequest;
+    videoBounds = null;
+    videoSurface?.hide();
+    if (videoSurface && win?.isFullScreen()) win.setFullScreen(false);
+    await runPlaybackWork(async () => {
+      savePlaybackProgress();
+      await controller?.stop();
+    });
     return { stopped: true };
   });
 }
@@ -887,6 +942,12 @@ async function bootstrap(): Promise<void> {
   mkdirSync(userData, { recursive: true });
   repo = createRepository(join(userData, 'nebula.db'));
   settings = loadSettings();
+  const storedTmdbCredential = repo.getSetting(TMDB_CREDENTIAL_KEY);
+  if (typeof storedTmdbCredential === 'string') tmdbCredential = decryptSecret(storedTmdbCredential);
+  tmdbSync = new TmdbSync(repo, () => tmdbCredential, electronFetch, (status) => {
+    broadcast(IPC.evTmdbSync, status);
+    if (status.phase !== 'running' && status.matched > 0) broadcast(IPC.evLibrary, { reason: 'tmdb-sync' });
+  });
   mkdirSync(settings.cacheDir, { recursive: true });
 
   const located = await locateMpv(settings.mpvPath);
@@ -931,7 +992,6 @@ if (!app.requestSingleInstanceLock()) {
 
 app.on('window-all-closed', () => {
   log('[app] window-all-closed → 退出');
-  controller?.dispose();
   if (process.platform !== 'darwin') app.quit();
 });
 
@@ -953,6 +1013,7 @@ process.on('unhandledRejection', (reason) => {
 });
 
 app.on('before-quit', () => {
+  tmdbSync?.cancel();
   controller?.dispose();
   repo?.close();
 });

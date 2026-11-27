@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import QRCode from 'qrcode';
 import { log } from '../logger';
 import { ProviderError } from './types';
@@ -176,7 +177,7 @@ export async function startQrLogin(): Promise<QrSession> {
     color: { dark: '#0a0d14', light: '#ffffff' },
   });
   return {
-    id: `qr_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+    id: randomUUID(),
     t: String(data.t),
     ck: data.ck,
     codeContent: data.codeContent,
@@ -188,7 +189,7 @@ export async function startQrLogin(): Promise<QrSession> {
 function normalizeStatus(raw: unknown): QrStatus {
   const s = typeof raw === 'string' ? raw.toUpperCase() : '';
   if (s === 'NEW' || s === 'SCANED' || s === 'SCANNED' || s === 'CONFIRMED' || s === 'EXPIRED') {
-    return s === 'SCANNED' ? 'SCANNED' : (s as QrStatus);
+    return s === 'SCANED' ? 'SCANNED' : s;
   }
   return 'UNKNOWN';
 }
